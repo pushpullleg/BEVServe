@@ -78,6 +78,16 @@ cd /path/to/BEVDet && python /path/to/bevserve/tools/compare_direct.py \
 cd /path/to/BEVDet && python /path/to/bevserve/tools/full_val_parity.py --out /tmp/fullval
 ```
 
+## Containers (M4)
+
+`docker/Dockerfile.gpu` (multi-stage, pinned sources and base-image digests, non-root, no weights
+or data in any layer), `docker/compose.yaml` (GPU, read-only checkpoint mount, host port on
+127.0.0.1 only, restart on process exit) and `docker/Dockerfile.cpu` for the CPU smoke test. Host
+prerequisites and their rollback: [docs/host-setup.md](docs/host-setup.md); deployment details and
+offline verification: [docs/deploy.md](docs/deploy.md). The CPU smoke stack builds from public
+sources without Docker: `python3.10 -m venv .venv-cpu && PYTHON=.venv-cpu/bin/python bash
+docker/build_cpu_stack.sh`.
+
 ## API summary
 
 Request parts: `CAM_FRONT_LEFT`, `CAM_FRONT`, `CAM_FRONT_RIGHT`, `CAM_BACK_LEFT`, `CAM_BACK`,

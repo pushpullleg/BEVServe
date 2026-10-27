@@ -1,0 +1,21 @@
+# Whitelist: only build inputs enter the build context. Weights, datasets, outputs, virtual
+# environments, git history and local configuration can never reach an image layer.
+*
+!pyproject.toml
+!README.md
+!LICENSE
+!NOTICE
+!src/
+!docker/requirements-model.txt
+!docker/requirements-cpu.txt
+!docker/patches/
+!docker/build_cpu_stack.sh
+!configs/
+!tests/
+!tools/check_restricted.py
+**/__pycache__
+**/*.pyc
+**/*.pth
+**/*.pt
+**/*.pkl
+**/*.npz

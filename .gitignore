@@ -25,3 +25,8 @@ outputs/
 # Local configuration
 .env
 .env.*
+!docker/.env.example
+
+# Local build and CPU smoke environments
+.venv-cpu/
+.cache/

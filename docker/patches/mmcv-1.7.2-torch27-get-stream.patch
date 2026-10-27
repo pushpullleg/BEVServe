@@ -1,0 +1,16 @@
+mmcv-full 1.7.2 on PyTorch >= 2.6: torch's internal _get_stream() takes a torch.device, while
+mmcv's Scatter passes an int GPU index, so MMDataParallel scatter fails. BEVServe's own inference
+path does not use MMDataParallel; the patch is applied so the image matches the validated stack.
+Apply with `git apply` in the mmcv v1.7.2 source tree (commit 4c01b026) before building.
+
+--- a/mmcv/parallel/_functions.py
++++ b/mmcv/parallel/_functions.py
+@@ -72,7 +72,7 @@
+         streams = None
+         if input_device == -1 and target_gpus != [-1]:
+             # Perform CPU to GPU copies in a background stream
+-            streams = [_get_stream(device) for device in target_gpus]
++            streams = [_get_stream(torch.device("cuda", device) if isinstance(device, int) else device) for device in target_gpus]
+ 
+         outputs = scatter(input, target_gpus, streams)
+         # Synchronize with the copy stream

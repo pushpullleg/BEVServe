@@ -1,0 +1,64 @@
+# BEVServe with the real model on one NVIDIA GPU.
+#
+#   cp docker/.env.example docker/.env   # then set the checkpoint directory and sha256
+#   docker compose -f docker/compose.yaml --env-file docker/.env up -d
+#
+# Networking: inside its own network namespace the server binds 0.0.0.0 (explicitly allow-listed
+# via BEVSERVE_ALLOWED_BIND_HOSTS) so that Docker's port forwarding can reach it. On the host the
+# port is published on 127.0.0.1 only, so the API is not reachable from other machines.
+#
+# Restarts: Docker restarts on process exit, not on health status. A fatal CUDA error makes the
+# server exit with code 70 and "on-failure" restarts it; an initialization failure (wrong hash,
+# no GPU) keeps the process up and not-ready, so it does not crash-loop.
+
+name: bevserve
+
+services:
+  bevserve:
+    image: ${BEVSERVE_IMAGE:-bevserve:gpu}
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.gpu
+    environment:
+      BEVSERVE_CHECKPOINT_SHA256: ${BEVSERVE_CHECKPOINT_SHA256:?set the trusted checkpoint sha256}
+      BEVSERVE_CHECKPOINT: /models/${BEVSERVE_CHECKPOINT_FILE:-bevdet-r50-cbgs.pth}
+      BEVSERVE_MAX_IN_FLIGHT: ${BEVSERVE_MAX_IN_FLIGHT:-5}
+      BEVSERVE_DEADLINE_S: ${BEVSERVE_DEADLINE_S:-10}
+      BEVSERVE_GIT_COMMIT: ${BEVSERVE_GIT_COMMIT:-}
+    volumes:
+      - type: bind
+        source: ${BEVSERVE_CHECKPOINT_DIR:?set the host directory holding the checkpoint}
+        target: /models
+        read_only: true
+    ports:
+      - "127.0.0.1:${BEVSERVE_HOST_PORT:-8000}:8000"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${BEVSERVE_GPU:-0}"]
+              capabilities: [gpu]
+        limits:
+          memory: 16g
+          pids: 512
+    restart: on-failure:5
+    stop_signal: SIGTERM
+    stop_grace_period: 30s
+    read_only: true
+    tmpfs:
+      - /tmp:size=1g
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/readyz', timeout=2).status == 200 else 1)"
+      interval: 10s
+      timeout: 3s
+      start_period: 60s
+      retries: 3

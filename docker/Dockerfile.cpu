@@ -1,0 +1,24 @@
+# syntax=docker/dockerfile:1.7
+# CPU-only image for the public T1 smoke test (random weights, synthetic input; no GPU, data or
+# checkpoint). Same pinned sources and package versions as Dockerfile.gpu, built by the same
+# script as CI and local runs (docker/build_cpu_stack.sh).
+#
+#   docker build -f docker/Dockerfile.cpu -t bevserve:cpu-smoke . && docker run --rm bevserve:cpu-smoke
+
+FROM ubuntu:22.04@sha256:e0f80c829509ef4df9e76bd8944eb7b8ec25cbb379b112a7f9448b2c77a77c9b
+
+ENV DEBIAN_FRONTEND=noninteractive PIP_NO_CACHE_DIR=1
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      python3.10 python3.10-venv python3.10-dev git build-essential ca-certificates libgomp1 \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY . /src/bevserve
+RUN python3.10 -m venv /opt/venv \
+ && PYTHON=/opt/venv/bin/python SRC_DIR=/opt/src MAX_JOBS=8 bash /src/bevserve/docker/build_cpu_stack.sh \
+ && useradd --system --uid 10001 --no-create-home --shell /usr/sbin/nologin smoke
+
+ENV CUDA_VISIBLE_DEVICES="" PYTHONDONTWRITEBYTECODE=1 HOME=/tmp
+USER 10001
+WORKDIR /src/bevserve
+CMD ["/opt/venv/bin/python", "-m", "pytest", "-q", "-p", "no:cacheprovider", "tests/smoke"]

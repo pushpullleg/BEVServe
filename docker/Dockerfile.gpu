@@ -1,0 +1,111 @@
+# syntax=docker/dockerfile:1.7
+# BEVServe GPU image: BEVDet-R50 inference service.
+#
+# Stage "build" compiles mmcv-full and BEVDet's bev_pool_v2 CUDA extension; stage "runtime"
+# carries only the Python environment, BEVDet's pinned configs and BEVServe. No checkpoint, no
+# dataset and no private file is copied: weights are mounted read-only at run time.
+#
+#   DOCKER_BUILDKIT=1 docker build -f docker/Dockerfile.gpu -t bevserve:gpu .
+#
+# Supported GPUs: CUDA_ARCH_LIST below (default 12.0 = Blackwell sm_120, the validated target).
+# Add architectures (e.g. "8.6;8.9;9.0;12.0+PTX") for other GPUs; only sm_120 is validated.
+
+ARG CUDA_DEVEL=nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04@sha256:ad6d59a3bbf3e82c1c849c9ac09cfc2a3e0bbb8655042fd899be6681b3fe2a85
+ARG CUDA_RUNTIME=nvidia/cuda:12.8.1-cudnn-runtime-ubuntu22.04@sha256:17e2934e1fa96152b14f78078bfbafd0f00f391df995dc6c641a720fce1202bb
+
+# ---------------------------------------------------------------------------------------- build
+FROM ${CUDA_DEVEL} AS build
+
+ARG MMCV_REPO=https://github.com/open-mmlab/mmcv.git
+ARG MMCV_REF=4c01b026f0afa5a91a5f54aea313788da1e40f95
+ARG BEVDET_REPO=https://github.com/pushpullleg/BEVDet.git
+ARG BEVDET_REF=a0142cc1074fefa0079b1b1f10e0367047913c86
+ARG CUDA_ARCH_LIST=12.0
+ARG MAX_JOBS=16
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    TORCH_CUDA_ARCH_LIST=${CUDA_ARCH_LIST} \
+    MAX_JOBS=${MAX_JOBS}
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      python3.10 python3.10-venv python3.10-dev git build-essential ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN python3.10 -m venv /opt/venv
+ENV PATH=/opt/venv/bin:$PATH
+
+COPY docker/requirements-model.txt /tmp/requirements-model.txt
+RUN pip install "setuptools<70" wheel ninja==1.13.2 \
+ && pip install --no-deps --index-url https://download.pytorch.org/whl/cu128 \
+      torch==2.7.0+cu128 torchvision==0.22.0+cu128 \
+ && pip install --no-deps -r /tmp/requirements-model.txt
+
+# mmcv-full 1.7.2 from source (pinned commit + torch 2.7 patch), CUDA ops for CUDA_ARCH_LIST.
+COPY docker/patches/mmcv-1.7.2-torch27-get-stream.patch /tmp/mmcv.patch
+RUN git init -q /src/mmcv && cd /src/mmcv \
+ && git fetch -q --depth 1 "${MMCV_REPO}" "${MMCV_REF}" && git checkout -q FETCH_HEAD \
+ && git apply /tmp/mmcv.patch \
+ && MMCV_WITH_OPS=1 FORCE_CUDA=1 pip install --no-build-isolation --no-deps . \
+ && cd / && rm -rf /src/mmcv
+
+# BEVDet (mmdet3d 1.0.0rc4 dev3.0 + Blackwell compatibility commit) with bev_pool_v2.
+RUN git init -q /src/bevdet && cd /src/bevdet \
+ && git fetch -q --depth 1 "${BEVDET_REPO}" "${BEVDET_REF}" && git checkout -q FETCH_HEAD \
+ && FORCE_CUDA=1 pip install --no-build-isolation --no-deps . \
+ && mkdir -p /opt/bevdet && cp -r configs /opt/bevdet/configs \
+ && cd / && rm -rf /src/bevdet
+
+COPY pyproject.toml README.md LICENSE NOTICE /src/bevserve/
+COPY src /src/bevserve/src
+RUN pip install --no-deps /src/bevserve \
+ && pip freeze > /opt/venv/bevserve-manifest.txt \
+ && (pip check > /opt/venv/bevserve-pip-check.txt 2>&1 || true)
+
+# ------------------------------------------------------------------------------------ runtime
+FROM ${CUDA_RUNTIME} AS runtime
+
+ARG MMCV_REF=4c01b026f0afa5a91a5f54aea313788da1e40f95
+ARG BEVDET_REF=a0142cc1074fefa0079b1b1f10e0367047913c86
+ARG CUDA_ARCH_LIST=12.0
+LABEL org.opencontainers.image.title="bevserve" \
+      org.opencontainers.image.licenses="Apache-2.0" \
+      bevserve.mmcv.ref="${MMCV_REF}" \
+      bevserve.bevdet.ref="${BEVDET_REF}" \
+      bevserve.cuda.arch="${CUDA_ARCH_LIST}"
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends python3.10 python3-lib2to3 python3-distutils libgomp1 \
+ && rm -rf /var/lib/apt/lists/* \
+ && useradd --system --uid 10001 --no-create-home --shell /usr/sbin/nologin bevserve
+
+COPY --from=build /opt/venv /opt/venv
+COPY --from=build /opt/bevdet /opt/bevdet
+
+ENV PATH=/opt/venv/bin:$PATH \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    HOME=/tmp \
+    NUMBA_CACHE_DIR=/tmp/numba \
+    MPLCONFIGDIR=/tmp/matplotlib \
+    BEVSERVE_DETECTOR=bevdet \
+    BEVSERVE_BEVDET_CONFIG=/opt/bevdet/configs/bevdet/bevdet-r50-cbgs.py \
+    BEVSERVE_CHECKPOINT=/models/bevdet-r50-cbgs.pth \
+    BEVSERVE_CHECKPOINT_ALLOWED_DIRS='["/models"]' \
+    BEVSERVE_HOST=0.0.0.0 \
+    BEVSERVE_ALLOWED_BIND_HOSTS='["0.0.0.0"]' \
+    BEVSERVE_PORT=8000
+
+# Fail the build, not the deployment, if the runtime stage lacks anything the model stack imports.
+# Ubuntu splits lib2to3 and distutils out of the Python standard library: mmcv's Config imports
+# yapf -> lib2to3, and mmcv's parrots_wrapper imports torch.utils.cpp_extension -> setuptools ->
+# distutils.core. The guard imports the whole model path, including both compiled extensions
+# (they link libcudart, not the driver's libcuda, so no GPU is needed at build time).
+RUN python -c "import lib2to3.pgen2.tokenize, distutils.core, yapf; from mmcv import Config; import torch.utils.cpp_extension, mmcv.utils.parrots_wrapper, mmdet, mmdet3d.models, bevserve.api, bevserve.model.bevdet_detector; from mmcv.ops import nms_rotated; from mmdet3d.ops.bev_pool_v2 import bev_pool; print('runtime import guard: OK')"
+
+USER 10001
+WORKDIR /tmp
+EXPOSE 8000
+ENTRYPOINT ["bevserve"]

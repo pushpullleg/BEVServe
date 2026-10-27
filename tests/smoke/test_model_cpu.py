@@ -10,8 +10,11 @@ patched into the view transformer for the duration of the test, in this process 
 
 from __future__ import annotations
 
+import importlib
 import json
 import os
+import sys
+import types
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +23,15 @@ import pytest
 
 torch = pytest.importorskip("torch")
 pytest.importorskip("mmdet3d")
+
+# A CPU-only stack has no compiled bev_pool_v2 extension (BEVDet cannot build it without CUDA).
+# Register an empty placeholder so BEVDet's modules import; the test replaces bev_pool_v2 itself
+# with the pure-PyTorch version below, so the placeholder is never called.
+_EXT = "mmdet3d.ops.bev_pool_v2.bev_pool_v2_ext"
+try:
+    importlib.import_module(_EXT)
+except ImportError:
+    sys.modules[_EXT] = types.ModuleType(_EXT)
 
 from tests.synthetic import synthetic_image, synthetic_rig  # noqa: E402
 
