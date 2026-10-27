@@ -1,0 +1,99 @@
+"""Private GPU tests (T2). Never run in public CI.
+
+Run only on an authorized GPU host, from a trusted checkout, in the model environment:
+
+    BEVSERVE_PRIVATE_GPU=1 BEVSERVE_BEVDET_CONFIG=... BEVSERVE_CHECKPOINT=... \\
+    BEVSERVE_CHECKPOINT_SHA256=... python -m pytest -q tests/private
+
+Uses synthetic inputs only; the real-data comparison is tools/m2_compare_direct.py.
+"""
+
+from __future__ import annotations
+
+import os
+
+import pytest
+
+if os.environ.get("BEVSERVE_PRIVATE_GPU") != "1":
+    pytest.skip("private GPU tests: set BEVSERVE_PRIVATE_GPU=1", allow_module_level=True)
+torch = pytest.importorskip("torch")
+pytest.importorskip("mmdet3d")
+if not torch.cuda.is_available():
+    pytest.skip("no CUDA device", allow_module_level=True)
+
+from bevserve.cli import make_factory  # noqa: E402
+from bevserve.detector import DetectorInitError  # noqa: E402
+from bevserve.model.bevdet_detector import (  # noqa: E402
+    BEVDetDetector,
+    _downloads_disabled,
+    load_bevdet,
+    warmup_inputs,
+)
+from bevserve.schemas import DetectResponse  # noqa: E402
+from bevserve.settings import Settings  # noqa: E402
+from tests.api.helpers import client_for  # noqa: E402
+from tests.synthetic import multipart_files  # noqa: E402
+
+pytestmark = pytest.mark.private
+
+
+@pytest.fixture(scope="module")
+def settings() -> Settings:
+    return Settings(detector="bevdet")
+
+
+@pytest.fixture(scope="module")
+def detector(settings: Settings) -> BEVDetDetector:
+    return load_bevdet(settings)
+
+
+def test_identity_is_the_trusted_checkpoint(detector: BEVDetDetector, settings: Settings) -> None:
+    assert detector.info.name == "bevdet-r50-cbgs"
+    assert detector.info.checkpoint_sha256 == settings.checkpoint_sha256
+    assert detector.info.config_sha256 is not None
+
+
+def test_detect_returns_valid_detections(detector: BEVDetDetector) -> None:
+    dets = detector.detect(warmup_inputs())
+    assert all(0 <= d.label_id < 10 and 0.1 <= d.score <= 1.0 for d in dets)
+
+
+def test_memory_is_stable_across_calls(detector: BEVDetDetector) -> None:
+    inputs = warmup_inputs()
+    detector.detect(inputs)
+    torch.cuda.synchronize()
+    before = torch.cuda.memory_allocated()
+    for _ in range(30):
+        detector.detect(inputs)
+    torch.cuda.synchronize()
+    assert torch.cuda.memory_allocated() - before < 16 * 2**20
+
+
+def test_wrong_hash_is_rejected(settings: Settings) -> None:
+    bad = settings.model_copy(update={"checkpoint_sha256": "0" * 64})
+    with pytest.raises(DetectorInitError) as err:
+        load_bevdet(bad)
+    assert err.value.reason == "checkpoint_hash_mismatch"
+
+
+def test_download_helpers_are_disabled_during_build() -> None:
+    import torch.hub
+
+    with _downloads_disabled(), pytest.raises(DetectorInitError) as err:
+        torch.hub.load_state_dict_from_url("https://example.invalid/w.pth")
+    assert err.value.reason == "network_download_attempted"
+
+
+@pytest.mark.anyio
+async def test_api_contract_is_unchanged_with_the_real_model(settings: Settings) -> None:
+    from bevserve.api import create_app
+
+    factory = make_factory(settings)
+    app = create_app(settings, factory, exit_fn=lambda code: None)
+    files, data = multipart_files()
+    async with client_for(app) as client:
+        resp = await client.post("/v1/detect", files=files, data=data)
+    assert resp.status_code == 200, resp.text
+    body = DetectResponse.model_validate(resp.json())
+    assert body.model.checkpoint_sha256 == settings.checkpoint_sha256
+    assert resp.headers["x-model-version"] == f"bevdet-r50-cbgs@{settings.checkpoint_sha256[:8]}"

@@ -1,0 +1,67 @@
+[build-system]
+requires = ["setuptools>=69,<80", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bevserve"
+version = "0.1.0.dev0"
+description = "HTTP inference service for camera-only 3D object detection (BEVDet). M1: contract, preprocessing and API with a fake detector."
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.10,<3.11"
+# Exact pins. numpy, pillow and opencv match the BEVDet model environment because they
+# change pixel values; do not bump them without re-running the preprocessing reference check.
+dependencies = [
+    "numpy==1.24.4",
+    "pillow==12.3.0",
+    "opencv-python-headless==4.8.1.78",
+    "pyquaternion==0.9.9",
+    "fastapi==0.162.0",
+    "starlette==1.7.0",
+    "pydantic==2.14.1",
+    "pydantic-settings==2.15.0",
+    "python-multipart==0.0.32",
+    "anyio==4.15.1",
+    "uvicorn==0.54.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==9.1.1",
+    "httpx==0.28.1",
+    "ruff==0.17.3",
+    "mypy==2.4.0",
+]
+
+[project.scripts]
+bevserve = "bevserve.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+markers = [
+    "private: needs restricted data or a GPU; never runs in public CI",
+]
+filterwarnings = ["error::pytest.PytestUnraisableExceptionWarning"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF", "ASYNC"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+mypy_path = "src"
+packages = ["bevserve"]
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = ["pyquaternion", "pyquaternion.*", "torch", "torch.*", "mmcv", "mmcv.*", "mmdet", "mmdet.*", "mmdet3d", "mmdet3d.*"]
+ignore_missing_imports = true

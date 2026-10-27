@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Restricted artifacts: never commit (nuScenes Terms of Use, checkpoint licensing)
+*.pth
+*.pt
+*.ckpt
+*.pkl
+*.npz
+data/
+samples/
+sweeps/
+maps/
+checkpoints/
+outputs/
+
+# Local configuration
+.env
+.env.*

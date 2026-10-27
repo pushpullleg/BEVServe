@@ -1,0 +1,18 @@
+BEVServe
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This project reimplements, for request-time use, the test-time image preprocessing and
+camera-frame conventions of the following Apache-2.0 projects. No source files are copied.
+
+- BEVDet (https://github.com/HuangJunJie2017/BEVDet), Copyright (c) Phigent Robotics.
+  Conventions taken from mmdet3d/datasets/pipelines/loading.py (PrepareImageInputs, BEVAug)
+  and mmdet3d/models/detectors/bevdet.py (BEVDet.prepare_inputs).
+- MMCV (https://github.com/open-mmlab/mmcv), Copyright (c) OpenMMLab.
+  Normalization order taken from mmcv/image/photometric.py (imnormalize).
+
+Data and model weights are NOT distributed with this project.
+
+- nuScenes is provided by Motional under CC BY-NC-SA 4.0 plus the nuScenes Terms of Use.
+  Obtain it from https://www.nuscenes.org/ and comply with its terms.
+- BEVDet checkpoints are published by their authors; obtain them from the BEVDet project.
+  This repository contains no checkpoint files and no files derived from nuScenes.
