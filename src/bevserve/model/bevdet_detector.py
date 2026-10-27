@@ -22,6 +22,7 @@ import logging
 import re
 import time
 from collections.abc import Iterator, Sequence
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -125,7 +126,8 @@ class BEVDetDetector:
     def info(self) -> DetectorInfo:
         return self._info
 
-    def detect(self, inputs: ModelInputs) -> Sequence[Detection]:
+    def detect_native(self, inputs: ModelInputs) -> tuple[Any, Any, Any]:
+        """BEVDet's own output: (N, 9) boxes with bottom-center z, scores, labels (numpy)."""
         inputs.check()
         torch = self._torch
         try:
@@ -143,7 +145,10 @@ class BEVDetDetector:
         except Exception as exc:
             kind = classify_runtime_error(exc)
             raise kind(f"{type(exc).__name__}: {str(exc)[:200]}") from exc
-        return detections_from_arrays(boxes, scores, labels)
+        return boxes, scores, labels
+
+    def detect(self, inputs: ModelInputs) -> Sequence[Detection]:
+        return detections_from_arrays(*self.detect_native(inputs))
 
 
 def _check_config(cfg: Any) -> None:
@@ -163,14 +168,36 @@ def _check_config(cfg: Any) -> None:
         raise DetectorInitError("config_mismatch", f"config differs from the contract: {failed}")
 
 
+def build_unloaded_model(config_path: Path) -> Any:
+    """Config -> contract check -> BEVDet model with no weights loaded (as in the thesis path).
+
+    compat_cfg only touches data/runner settings and is applied when the config has them.
+    Call inside _downloads_disabled() unless the caller controls network access itself.
+    """
+    from mmcv import Config
+    from mmdet3d.models import build_model
+
+    cfg = Config.fromfile(str(config_path))
+    if "data" in cfg:
+        try:
+            from mmdet.utils import compat_cfg
+        except ImportError:
+            from mmdet3d.utils import compat_cfg
+        cfg = compat_cfg(cfg)
+    _check_config(cfg)
+    cfg.model.pretrained = None
+    if "img_backbone" in cfg.model:
+        cfg.model.img_backbone.pretrained = None
+    cfg.model.train_cfg = None
+    return build_model(cfg.model, test_cfg=cfg.get("test_cfg"))
+
+
 def load_bevdet(settings: Settings) -> BEVDetDetector:
     """Build, verify, load and warm up BEVDet-R50. Raises DetectorInitError with a reason."""
     try:
         import torch
-        from mmcv import Config
         from mmcv.runner.checkpoint import load_state_dict
         from mmdet3d.core.bbox import LiDARInstance3DBoxes
-        from mmdet3d.models import build_model
         from mmdet3d.ops.bev_pool_v2 import bev_pool  # noqa: F401  (compiled op present)
     except ImportError as exc:
         raise DetectorInitError("model_stack_missing", f"cannot import {exc.name}") from exc
@@ -189,20 +216,8 @@ def load_bevdet(settings: Settings) -> BEVDetDetector:
         settings.checkpoint_max_bytes,
     )
 
-    cfg = Config.fromfile(str(config_path))
-    try:
-        from mmdet.utils import compat_cfg
-    except ImportError:
-        from mmdet3d.utils import compat_cfg
-    cfg = compat_cfg(cfg)
-    _check_config(cfg)
-    cfg.model.pretrained = None
-    if "img_backbone" in cfg.model:
-        cfg.model.img_backbone.pretrained = None
-    cfg.model.train_cfg = None
-
     with _downloads_disabled():
-        model = build_model(cfg.model, test_cfg=cfg.get("test_cfg"))
+        model = build_unloaded_model(config_path)
         try:
             checkpoint = torch.load(io.BytesIO(data), map_location="cpu", weights_only=True)
         except Exception as exc:  # pickle / unsafe-global errors: never retry unsafely

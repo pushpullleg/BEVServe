@@ -2,7 +2,8 @@ BEVServe
 Licensed under the Apache License, Version 2.0 (see LICENSE).
 
 This project reimplements, for request-time use, the test-time image preprocessing and
-camera-frame conventions of the following Apache-2.0 projects. No source files are copied.
+camera-frame conventions of the following Apache-2.0 projects. One file is copied with attribution:
+configs/bevdet-r50-cbgs-inference.py (BEVDet's model definition, used by the CPU smoke test).
 
 - BEVDet (https://github.com/HuangJunJie2017/BEVDet), Copyright (c) Phigent Robotics.
   Conventions taken from mmdet3d/datasets/pipelines/loading.py (PrepareImageInputs, BEVAug)

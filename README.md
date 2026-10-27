@@ -4,10 +4,12 @@ HTTP inference service for camera-only 3D object detection with
 [BEVDet](https://github.com/HuangJunJie2017/BEVDet): six camera images plus calibration in, 3D
 boxes out.
 
-> **Status: milestone M2.** The service serves the released BEVDet-R50 checkpoint on a local GPU
-> (`BEVSERVE_DETECTOR=bevdet`), or a **FakeDetector** with fixed synthetic boxes (default). On three
-> nuScenes val samples its boxes are identical to BEVDet's own evaluation path. Full-validation
-> accuracy parity (M3) and benchmarks (M5) are not done yet; no accuracy or latency claims are made.
+> **Status: milestone M3.** The service serves the released BEVDet-R50 checkpoint on a local GPU
+> (`BEVSERVE_DETECTOR=bevdet`), or a **FakeDetector** with fixed synthetic boxes (default).
+> Verified locally: over all 6,019 nuScenes val frames BEVServe's input path and adapter reproduce
+> the reference evaluation (mAP 0.3086, NDS 0.3941, identical to every printed digit), and HTTP
+> responses on 200 frames are identical to BEVDet's own evaluation path. Benchmarks (M5) are not
+> done; no latency claims are made.
 
 ## What M1 contains
 
@@ -37,6 +39,8 @@ python3.10 -m venv .venv
 .venv/bin/ruff check src tests tools && .venv/bin/ruff format --check src tests tools
 .venv/bin/mypy                          # strict
 .venv/bin/python tools/check_restricted.py
+# T1 CPU smoke test with random weights (needs torch + mmcv-full + BEVDet's mmdet3d):
+CUDA_VISIBLE_DEVICES= python -m pytest -q tests/smoke
 ```
 
 Optional, local only: compare preprocessing with a BEVDet dev3.0 checkout and its environment
@@ -58,7 +62,7 @@ kill %1
 The server refuses to bind a non-loopback address unless it is listed in
 `BEVSERVE_ALLOWED_BIND_HOSTS` (JSON list).
 
-## Real model (M2)
+## Real model (M2, M3)
 
 Needs a BEVDet dev3.0 checkout, its CUDA environment and an operator-supplied checkpoint with a
 trusted sha256; see [docs/env-m2.md](docs/env-m2.md). The checkpoint is read once, its hash is
@@ -69,8 +73,9 @@ Private checks, never run in public CI:
 ```bash
 BEVSERVE_PRIVATE_GPU=1 BEVSERVE_BEVDET_CONFIG=... BEVSERVE_CHECKPOINT=... \
   BEVSERVE_CHECKPOINT_SHA256=... python -m pytest -q tests/private
-cd /path/to/BEVDet && python /path/to/bevserve/tools/m2_compare_direct.py \
-  --checkpoint checkpoints/.../bevdet-r50-cbgs.pth --index 0 --url http://127.0.0.1:8000
+cd /path/to/BEVDet && python /path/to/bevserve/tools/compare_direct.py \
+  --checkpoint checkpoints/.../bevdet-r50-cbgs.pth --select scenes:50 --url http://127.0.0.1:8000
+cd /path/to/BEVDet && python /path/to/bevserve/tools/full_val_parity.py --out /tmp/fullval
 ```
 
 ## API summary
