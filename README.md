@@ -4,12 +4,12 @@ HTTP inference service for camera-only 3D object detection with
 [BEVDet](https://github.com/HuangJunJie2017/BEVDet): six camera images plus calibration in, 3D
 boxes out.
 
-> **Status: milestone M3.** The service serves the released BEVDet-R50 checkpoint on a local GPU
+> **Status: milestone M5.** The service serves the released BEVDet-R50 checkpoint on a local GPU
 > (`BEVSERVE_DETECTOR=bevdet`), or a **FakeDetector** with fixed synthetic boxes (default).
 > Verified locally: over all 6,019 nuScenes val frames BEVServe's input path and adapter reproduce
 > the reference evaluation (mAP 0.3086, NDS 0.3941, identical to every printed digit), and HTTP
-> responses on 200 frames are identical to BEVDet's own evaluation path. Benchmarks (M5) are not
-> done; no latency claims are made.
+> responses on 200 frames are identical to BEVDet's own evaluation path. The GPU container (M4) was
+> benchmarked on one workstation (M5, below).
 
 ## What M1 contains
 
@@ -88,6 +88,28 @@ offline verification: [docs/deploy.md](docs/deploy.md). The CPU smoke stack buil
 sources without Docker: `python3.10 -m venv .venv-cpu && PYTHON=.venv-cpu/bin/python bash
 docker/build_cpu_stack.sh`.
 
+## Performance (M5)
+
+Measured on one RTX PRO 6000 Blackwell workstation, client on the same host, 20 nuScenes val
+frames (six camera JPEGs each), closed-loop load; full method, caveats and raw-result provenance
+in [docs/m5-report.md](docs/m5-report.md).
+
+| Concurrency | Throughput | p50 | p95 |
+| --- | --- | --- | --- |
+| 1 | 9.2 req/s | 107.7 ms | 112.1 ms |
+| 8 | 42.2 req/s | 185.7 ms | 195.7 ms |
+
+- At concurrency 1 the server spends 89 of 104 ms on CPU JPEG decode and preprocessing and 12 ms
+  on the GPU; GPU utilization stayed below 40%.
+- All 1,200 requests across concurrency 1–8 succeeded. Under saturation with the production
+  admission limit, only `503 queue_full` with `Retry-After: 1` was returned, and the service
+  recovered.
+- A 100-request soak passed its memory and latency-drift limits, and 10-frame golden parity held
+  afterwards.
+- Cold start to ready took 4.6–4.8 s.
+- Not established: the overhead of the optional `Server-Timing` instrumentation (+1.1 ms measured,
+  95% CI −8.1 to +10.4 ms, against a 3.1 ms limit).
+
 ## API summary
 
 Request parts: `CAM_FRONT_LEFT`, `CAM_FRONT`, `CAM_FRONT_RIGHT`, `CAM_BACK_LEFT`, `CAM_BACK`,
@@ -124,7 +146,8 @@ in `ego@CAM_FRONT_LEFT` with `center` = geometric center; see [docs/frames.md](d
 Environment variables `BEVSERVE_*` (see `src/bevserve/settings.py`): `HOST` (default
 `127.0.0.1`), `PORT`, `ALLOWED_BIND_HOSTS`, `MAX_REQUEST_BYTES` (50 MiB), `MAX_IMAGE_BYTES`
 (8 MiB), `MAX_CALIBRATION_BYTES` (64 KiB), `MAX_IN_FLIGHT` (5), `DEADLINE_S` (10),
-`STALL_AFTER_S` (30), `FATAL_EXIT_GRACE_S`, `FATAL_EXIT_CODE`.
+`STALL_AFTER_S` (30), `FATAL_EXIT_GRACE_S`, `FATAL_EXIT_CODE`, `SERVER_TIMING` (false; adds a
+`Server-Timing` response header for benchmarks, body unchanged).
 
 ## Data and licensing
 

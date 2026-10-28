@@ -34,6 +34,11 @@ class Settings(BaseSettings):
 
     # Detector backend. "fake" returns fixed synthetic boxes; "bevdet" loads BEVDet-R50 (M2).
     detector: Literal["fake", "bevdet"] = "fake"
+
+    # Optional benchmark instrumentation: adds a Server-Timing response header with stage
+    # durations (and CUDA-event forward timing for the real model). Off by default; does not
+    # change the response body or any model output.
+    server_timing: bool = False
     git_commit: str | None = None
 
     # BEVDet backend (operator-supplied; never taken from a request).

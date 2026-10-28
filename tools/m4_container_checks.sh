@@ -42,6 +42,7 @@ exec 3>&1 4>&2
 FAILED=0
 CREATED=()          # container ids started by this run (docker run)
 COMPOSE_USED=0      # this run created Compose project $PROJECT
+DC=()               # compose CLI args (-p, -f files, --env-file) of the active configuration
 BUILD_TAG_MADE=0
 SUDO_KEEPALIVE=
 
@@ -62,9 +63,9 @@ cleanup() {
   exec 1>&3 2>&4
   log "cleanup: removing only resources created by run $RUN_ID"
   for cid in "${CREATED[@]}"; do d rm -f "$cid" >> "$LOG" 2>&1 || true; done
-  if [ "$COMPOSE_USED" = 1 ]; then
-    d compose -p "$PROJECT" logs --no-color > "$OUT/compose-logs.txt" 2>&1 || true   # evidence first
-    d compose -p "$PROJECT" down --remove-orphans >> "$LOG" 2>&1 || true
+  if [ "$COMPOSE_USED" = 1 ]; then   # same -p/-f/--env-file as `up` (the file needs the env file)
+    d "${DC[@]}" logs --no-color > "$OUT/compose-logs.txt" 2>&1 || true   # evidence first
+    d "${DC[@]}" down --remove-orphans >> "$LOG" 2>&1 || true
   fi
   if [ "$BUILD_TAG_MADE" = 1 ]; then d image rm "$BUILD_TAG" >> "$LOG" 2>&1 || true; fi
   [ -n "$SUDO_KEEPALIVE" ] && kill "$SUDO_KEEPALIVE" 2>/dev/null
@@ -199,9 +200,10 @@ BEVSERVE_CHECKPOINT_FILE=$CKPT_FILE
 BEVSERVE_CHECKPOINT_SHA256=$CKPT_SHA256
 BEVSERVE_HOST_PORT=$PORT
 BEVSERVE_GPU=$GPU
-BEVSERVE_GIT_COMMIT=$(git -C "$REPO" rev-parse --short HEAD)
+BEVSERVE_GIT_COMMIT=$(git -C "$REPO" describe --always --dirty --abbrev=7)
 EOF
-DC=(compose -p "$PROJECT" -f "$REPO/docker/compose.yaml" --env-file "$ENVF")
+BASE_DC=(compose -p "$PROJECT" -f "$REPO/docker/compose.yaml" --env-file "$ENVF")
+DC=("${BASE_DC[@]}")
 COMPOSE_USED=1
 d "${DC[@]}" up -d --no-build >> "$LOG" 2>&1 || die "compose up"
 CID=$(d "${DC[@]}" ps -q bevserve)
@@ -237,11 +239,11 @@ services:
     environment:
       BEVSERVE_FAULT_INJECTION_ACK: "1"
 EOF
-FDC=("${DC[@]}" -f "$OUT/compose.fault.yaml")
+DC=("${BASE_DC[@]}" -f "$OUT/compose.fault.yaml"); FDC=("${DC[@]}")
 d "${FDC[@]}" up -d --no-build >> "$LOG" 2>&1 || fail "fault: compose up"
-FID=$(d "${FDC[@]}" ps -q bevserve)
+FID=$(d "${FDC[@]}" ps -q bevserve) && [ -n "$FID" ] && FID=$(d inspect -f '{{.Id}}' "$FID")   # full id (events)
 if [ -n "$FID" ] && wait_ready 240 > /dev/null; then
-  T_START=$(date +%s); RC0=$(d inspect -f '{{.RestartCount}}' "$FID")
+  T_START=$(date +%s.%N); RC0=$(d inspect -f '{{.RestartCount}}' "$FID")
   PYTHONPATH="$REPO" PYTHONDONTWRITEBYTECODE=1 "$HOST_PY" - "$PORT" > "$OUT/fault_requests.txt" 2>> "$LOG" <<'PY'
 import sys, time, httpx
 from tests.synthetic import multipart_files
@@ -261,10 +263,17 @@ PY
   t0=$SECONDS
   while (( SECONDS - t0 < 120 )) && [ "$(d inspect -f '{{.RestartCount}}' "$FID")" = "$RC0" ]; do sleep 1; done
   RC1=$(d inspect -f '{{.RestartCount}}' "$FID")
-  EXITS=$(d events --since "$T_START" --until "$(date +%s)" --filter "container=$FID" --filter event=die \
-            --format '{{index .Actor.Attributes "exitCode"}}' 2>> "$LOG" | tr '\n' ' ')
-  echo "die events exit codes: $EXITS; restart count $RC0 -> $RC1" >> "$LOG"
-  [[ "$EXITS" == 70* ]] && pass "fault: process exited with code 70" || fail "fault: process exited with code 70 (saw: $EXITS)"
+  # --until must lie in the future: the daemon drops events later than --until, and a
+  # whole-second "now" cut off a die event in the current second (M5 stage A: empty result).
+  d events --since "$T_START" --until "$(( $(date +%s) + 2 ))" --filter type=container \
+    --filter "label=com.docker.compose.project=$PROJECT" --format '{{json .}}' > "$OUT/fault_events.jsonl" 2>> "$LOG"
+  if python3 "$REPO/tools/fault_events.py" --events "$OUT/fault_events.jsonl" --container "$FID" --exit-code 70 \
+       --restarts-before "$RC0" --restarts-after "$RC1" > "$OUT/fault_events.json" 2>> "$LOG"; then
+    pass "fault: process exited with code 70 (docker die event; restart $RC0 -> $RC1)"
+  else
+    fail "fault: process exited with code 70 (see fault_events.json)"
+  fi
+  cat "$OUT/fault_events.json" >> "$LOG"
   [ "$RC1" -gt "$RC0" ] && pass "fault: docker restarted the container ($RC0 -> $RC1)" || fail "fault: docker restarted the container"
   d logs "$FID" 2>&1 | grep -q "exiting with code 70" && pass "fault: fatal exit logged" || fail "fault: fatal exit logged"
   secs=$(wait_ready 240) && pass "fault: ready again after restart (${secs} s)" || fail "fault: ready again after restart"
@@ -272,6 +281,7 @@ else
   fail "fault: injected service did not become ready"
 fi
 d "${FDC[@]}" down --remove-orphans >> "$LOG" 2>&1
+DC=("${BASE_DC[@]}")
 
 # ------------------------------------------------------------------- 6. initialization failures
 log "== 6. initialization failures: service stays up, not ready, no restarts"

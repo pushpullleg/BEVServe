@@ -267,10 +267,13 @@ async def _detect(request: Request, service: Service) -> JSONResponse:
     settings = service.settings
     _require_ready(service)
     form = await _read_form(request, settings)
+    stages: dict[str, float] = {"parse": (time.perf_counter() - started) * 1000}
     try:
+        t_validate = time.perf_counter()
         parts, calibration_text = _collect_parts(form, settings)
         calibration = _parse_calibration(calibration_text)
         raw = await _check_images(parts)
+        stages["validate"] = (time.perf_counter() - t_validate) * 1000
 
         executor = service.executor
         if executor is None:
@@ -290,7 +293,10 @@ async def _detect(request: Request, service: Service) -> JSONResponse:
             )
             t_inf = time.perf_counter()
             try:
-                detections = await executor.run(admission, inputs, settings.deadline_s)
+                job_timing: dict[str, float] | None = {} if settings.server_timing else None
+                detections = await executor.run(
+                    admission, inputs, settings.deadline_s, timing=job_timing
+                )
             except DeadlineExceededError as exc:
                 raise ApiError(
                     504,
@@ -324,4 +330,32 @@ async def _detect(request: Request, service: Service) -> JSONResponse:
             total=round((time.perf_counter() - started) * 1000, 3),
         ),
     )
-    return JSONResponse(body.model_dump(), headers={"X-Model-Version": _model_version(info)})
+    t_serialize = time.perf_counter()
+    response = JSONResponse(body.model_dump(), headers={"X-Model-Version": _model_version(info)})
+    if settings.server_timing:
+        stages.update(decode=decode_ms, preprocess=preprocess_ms, **(job_timing or {}))
+        stages["serialize"] = (time.perf_counter() - t_serialize) * 1000
+        stages["total"] = (time.perf_counter() - started) * 1000
+        response.headers["Server-Timing"] = server_timing_header(stages)
+    return response
+
+
+SERVER_TIMING_ORDER = (
+    "parse",
+    "validate",
+    "decode",
+    "preprocess",
+    "queue",
+    "gpu",
+    "h2d",
+    "forward",
+    "serialize",
+    "total",
+)
+
+
+def server_timing_header(stages: dict[str, float]) -> str:
+    """RFC-style Server-Timing value, e.g. "decode;dur=15.20, gpu;dur=12.01" (milliseconds)."""
+    return ", ".join(
+        f"{name};dur={stages[name]:.3f}" for name in SERVER_TIMING_ORDER if name in stages
+    )

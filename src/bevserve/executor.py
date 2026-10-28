@@ -45,10 +45,10 @@ class Admission:
         self._released = False
         self._owned_by_job = False
 
-    def submit(self, inputs: ModelInputs) -> JobFuture:
+    def submit(self, inputs: ModelInputs, timing: dict[str, float] | None = None) -> JobFuture:
         if self._owned_by_job or self._released:
             raise RuntimeError("admission already used")
-        future = self._executor._submit(inputs)
+        future = self._executor._submit(inputs, timing)
         self._owned_by_job = True
         future.add_done_callback(lambda _: self.release())
         return future
@@ -110,16 +110,26 @@ class InferenceExecutor:
 
     # ------------------------------------------------------------ execution
 
-    def _submit(self, inputs: ModelInputs) -> JobFuture:
-        return self._pool.submit(self._job, inputs)
+    def _submit(self, inputs: ModelInputs, timing: dict[str, float] | None) -> JobFuture:
+        return self._pool.submit(self._job, inputs, timing, time.perf_counter())
 
-    def _job(self, inputs: ModelInputs) -> Sequence[Detection]:
+    def _job(
+        self, inputs: ModelInputs, timing: dict[str, float] | None, submitted: float
+    ) -> Sequence[Detection]:
         with self._lock:
             if self._fatal:
                 raise FatalDetectorError("detector is in a fatal state")
             self._running_since = time.monotonic()
+        started = time.perf_counter()
         try:
-            return self._detector.detect(inputs)
+            detections = self._detector.detect(inputs)
+            if timing is not None:  # optional instrumentation; read on the slot thread
+                timing["queue"] = (started - submitted) * 1000
+                timing["gpu"] = (time.perf_counter() - started) * 1000
+                extra = getattr(self._detector, "last_timing", None)
+                if isinstance(extra, dict):
+                    timing.update(extra)
+            return detections
         except FatalDetectorError as exc:
             with self._lock:
                 self._fatal = True
@@ -130,10 +140,18 @@ class InferenceExecutor:
                 self._running_since = None
 
     async def run(
-        self, admission: Admission, inputs: ModelInputs, deadline_s: float
+        self,
+        admission: Admission,
+        inputs: ModelInputs,
+        deadline_s: float,
+        timing: dict[str, float] | None = None,
     ) -> Sequence[Detection]:
-        """Submit and wait up to deadline_s. Raises DeadlineExceededError, or the job's error."""
-        future = admission.submit(inputs)
+        """Submit and wait up to deadline_s. Raises DeadlineExceededError, or the job's error.
+
+        timing (optional): filled with "queue" (submit to start) and "gpu" (detect wall time; the
+        detector synchronizes the GPU before returning) in ms, plus any detector-specific stages.
+        """
+        future = admission.submit(inputs, timing)
         waiter = asyncio.wrap_future(future)
         try:
             return await asyncio.wait_for(asyncio.shield(waiter), timeout=deadline_s)

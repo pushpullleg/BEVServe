@@ -97,3 +97,26 @@ async def test_api_contract_is_unchanged_with_the_real_model(settings: Settings)
     body = DetectResponse.model_validate(resp.json())
     assert body.model.checkpoint_sha256 == settings.checkpoint_sha256
     assert resp.headers["x-model-version"] == f"bevdet-r50-cbgs@{settings.checkpoint_sha256[:8]}"
+
+
+def test_timing_instrumentation_does_not_change_outputs(detector: BEVDetDetector) -> None:
+    """M5: CUDA-event timing (BEVSERVE_SERVER_TIMING) must leave every output bit-identical."""
+    import numpy as np
+
+    inputs = warmup_inputs()
+    inputs = type(inputs)(
+        np.random.default_rng(5).standard_normal(inputs.imgs.shape).astype(np.float32),
+        *inputs.as_tuple()[1:],
+    )
+    detector.timing_enabled = False
+    plain = detector.detect_native(inputs)
+    assert detector.last_timing is None
+    detector.timing_enabled = True
+    try:
+        timed = detector.detect_native(inputs)
+        assert set(detector.last_timing or {}) == {"h2d", "forward"}
+        assert all(v > 0 for v in (detector.last_timing or {}).values())
+    finally:
+        detector.timing_enabled = False
+    for a, b in zip(plain, timed, strict=True):
+        np.testing.assert_array_equal(a, b)

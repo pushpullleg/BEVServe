@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Fake `nvidia-smi` for orchestration tests: one GPU; the fake server (if running) is the only
+# compute app. FAKE_SMI_NOAPPS=1: the server is never listed (unattributed GPU memory).
+set -u
+case "$*" in
+  *--query-gpu=utilization.gpu,memory.used*) echo "7, 2048" ;;
+  *--query-gpu=name*) echo "Fake GPU, 0.0, 1 MiB" ;;
+  *--query-compute-apps*)
+    if [ "${FAKE_SMI_NOAPPS:-0}" != 1 ] && [ -f "$FAKE_STATE/pid" ]; then echo "$(cat "$FAKE_STATE/pid"), 1300"; fi ;;
+esac

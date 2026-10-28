@@ -121,6 +121,10 @@ class BEVDetDetector:
         self._device = device
         self._info = info
         self._meta = {"box_type_3d": box_type}
+        # Optional benchmark instrumentation (BEVSERVE_SERVER_TIMING): CUDA-event timing of the
+        # forward call. Recording events does not change any computation or output.
+        self.timing_enabled = False
+        self.last_timing: dict[str, float] | None = None
 
     @property
     def info(self) -> DetectorInfo:
@@ -132,12 +136,24 @@ class BEVDetDetector:
         torch = self._torch
         try:
             with torch.no_grad():
+                t0 = time.perf_counter()
                 tensors = [
                     torch.from_numpy(a).unsqueeze(0).to(self._device) for a in inputs.as_tuple()
                 ]
+                if self.timing_enabled:
+                    torch.cuda.synchronize(self._device)
+                    h2d_ms = (time.perf_counter() - t0) * 1000
+                    start, end = (torch.cuda.Event(enable_timing=True) for _ in range(2))
+                    start.record()
                 result = self._model.forward_test(
                     points=[None], img_metas=[[self._meta]], img_inputs=[tensors], rescale=True
                 )
+                if self.timing_enabled:
+                    end.record()
+                    end.synchronize()
+                    # forward = GPU time of forward_test: backbone, view transform, BEV encoder,
+                    # head, decode, NMS and BEVDet's own copy of the results to the CPU.
+                    self.last_timing = {"h2d": h2d_ms, "forward": start.elapsed_time(end)}
                 pts = result[0]["pts_bbox"]
                 boxes = pts["boxes_3d"].tensor.detach().cpu().numpy()
                 scores = pts["scores_3d"].detach().cpu().numpy()
@@ -247,6 +263,7 @@ def load_bevdet(settings: Settings) -> BEVDetDetector:
         class_names=CLASS_NAMES,
     )
     detector = BEVDetDetector(model, device, info, LiDARInstance3DBoxes)
+    detector.timing_enabled = settings.server_timing
 
     inputs = warmup_inputs()
     try:
