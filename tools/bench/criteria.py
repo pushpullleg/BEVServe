@@ -39,6 +39,15 @@ AB_C1_P50_MAX_UCB = 0.85
 AB_C8_RPS_MIN_LCB = 0.95
 AB_C8_P95_MAX_UCB = 1.10
 AB_MEMORY_MAX_UCB = 1.10
+# M7 reliability (docs/m7-plan.md, frozen before the GPU runs).
+REL_RECOVERY_READY_S = 2.0
+REL_ADMITTED_P99_FACTOR = 2.0
+REL_THREADS_ACCEPT_MAX = 300
+REL_THREADS_RANGE_MAX = 8
+REL_GPU_GROWTH_MAX_MIB = 128
+REL_GPU_TOTAL_MAX_MIB = 2048
+REL_RSS_SLOPE_MAX_MIB_H = 80
+REL_DRIFT_MAX = 1.10
 
 
 def plan(p: dict[str, Any]) -> dict[str, list[tuple[str, int, int, int]]]:
@@ -61,6 +70,16 @@ def plan(p: dict[str, Any]) -> dict[str, list[tuple[str, int, int, int]]]:
             + [("admission-recovery", 5, 0, 1)]
         ),
         "soak": lambda: [(f"soak-{p['soak_requests']}", p["soak_requests"], p["soak_warmup"], 2)],
+        "rel-admission": lambda: rel_admission_runs(p),
+        "rel-diag": lambda: diag_runs(p, "rel-diag"),
+        "rel-diagmp": lambda: diag_runs(p, "rel-diagmp"),
+        "rel-sustained": lambda: (
+            [("rel-ref", p["n_inputs"], 0, 1)]
+            + [
+                (f"rel-sust-b{b}", p["rel_block_s"] * 100, 0, p["rel_sustained_c"])
+                for b in range(1, rel_blocks(p) + 1)
+            ]
+        ),
         "ab": lambda: [
             (f"ab-t{k}-{arm}-c{c}", p[f"ab_c{c}_requests"], p["ab_warmup"], c)
             for k, arm in ab_trials(p["ab_trials"])
@@ -68,6 +87,29 @@ def plan(p: dict[str, Any]) -> dict[str, list[tuple[str, int, int, int]]]:
         ],
     }
     return {s: stages[s]() for s in p["stages"]}
+
+
+def rel_blocks(p: dict[str, Any]) -> int:
+    return -(-p["rel_sustained_s"] // p["rel_block_s"])
+
+
+def rel_admission_runs(p: dict[str, Any]) -> list[tuple[str, int, int, int]]:
+    cap = p["rel_max_attempts"]
+    runs = [("rel-ref", p["n_inputs"], 0, 1), ("rel-base-c5", cap, 0, 5)]
+    for spec in p["rel_overload"]:
+        c, m = spec.split(":")
+        runs += [(f"rel-c{c}-{m}", cap, 0, int(c)), (f"rel-c{c}-{m}-recovery", 25, 0, 5)]
+    if p["mode"] == "full":
+        runs.append(("rel-serial-c16-honor", cap, 0, 16))
+    return runs
+
+
+def diag_runs(p: dict[str, Any], prefix: str) -> list[tuple[str, int, int, int]]:
+    return [("rel-ref", p["n_inputs"], 0, 1)] + [
+        (f"{prefix}-{arm}-{ph}", p["rel_max_attempts"], 0, c)
+        for arm in ("a", "b")
+        for ph, c in (("base-c5", 5), ("c32-noretry", 32))
+    ]
 
 
 def ab_trials(trials: int) -> list[tuple[int, str]]:
@@ -172,6 +214,10 @@ def evaluate(d: Path) -> dict[str, Any]:
     sampled = [s for s in SAMPLED_STAGES if s in stages]
     if "ab" in stages:
         sampled += [f"ab-t{k}" for k, _ in ab_trials(params["ab_trials"])]
+    sampled += [s for s in ("rel-admission", "rel-sustained") if s in stages]
+    for prefix in ("rel-diag", "rel-diagmp"):
+        if prefix in stages:
+            sampled += [f"{prefix}-a", f"{prefix}-b"]
     bad_s = [s for s in sampled if records.get(("sampler", s), {}).get("valid") is not True]
     put(
         "execution: resource samplers ran throughout and attributed GPU memory to the server",
@@ -365,7 +411,398 @@ def evaluate(d: Path) -> dict[str, Any]:
     )
     if "ab" in stages:
         evaluate_ab(d, params, records, service_records, summ, put, out)
+    for rel in ("rel-admission", "rel-sustained"):
+        if rel in stages:
+            evaluate_rel(d, rel, params, stages[rel], records, service_records, summ, put, out)
+    for prefix in ("rel-diag", "rel-diagmp"):
+        if prefix in stages:
+            evaluate_diag(d, params, records, service_records, summ, put, out, prefix)
     return out
+
+
+def evaluate_diag(
+    d: Path,
+    params: dict[str, Any],
+    records: dict[tuple[str, str], dict[str, Any]],
+    services: list[dict[str, Any]],
+    summ: Any,
+    put: Any,
+    out: dict[str, Any],
+    prefix: str = "rel-diag",
+) -> None:
+    """Execution and correctness of the diagnostic; its latency results are reported, not judged."""
+    rel, threads, mif = prefix, params["rel_threads"], params["rel_max_in_flight"]
+    got = [
+        (r.get("stage"), r.get("preprocess_threads_env"), r.get("server_timing")) for r in services
+    ]
+    expected = [("rel-ref", 0, False), (f"{rel}-a", 0, True), (f"{rel}-b", threads, True)]
+    put(
+        f"{rel}: reference (threads 0), arm A (threads 0) and arm B (threads {threads}) in fresh "
+        f"containers, max_in_flight {mif}, Server-Timing on in both arms",
+        "correctness",
+        rel,
+        got == expected
+        and all(r.get("max_in_flight") == mif for r in services)
+        and len({r.get("container") for r in services}) == len(services),
+        services=got,
+        expected=expected,
+    )
+    labels = [f"{rel}-{a}-{ph}" for a in ("a", "b") for ph in ("base-c5", "c32-noretry")]
+    sums = {label: summ(label) for label in labels}
+    put(
+        f"{rel}: only 200 or 503 queue_full; every 200 equals the serial reference",
+        "correctness",
+        rel,
+        all(
+            s is not None
+            and set(s["outcomes"]) <= {"ok", "rejected"}
+            and (s.get("outputs") or {}).get("mismatches") == 0
+            and not (s.get("outputs") or {}).get("inconsistent_inputs")
+            for s in sums.values()
+        ),
+        phases={k: (s or {}).get("outcomes", "invalid run") for k, s in sums.items()},
+    )
+    timed = {}
+    for label in labels:
+        f = d / f"{label}.requests.jsonl"
+        rows = (
+            [json.loads(x) for x in f.read_text().splitlines() if x.strip()] if f.exists() else []
+        )
+        ok = [r for r in rows if r.get("status") == 200]
+        timed[label] = [
+            sum(1 for r in ok if {"queue", "gpu"} <= set(r.get("server") or {})),
+            len(ok),
+        ]
+    put(
+        f"{rel}: Server-Timing active in both arms (every 200 carries queue and gpu stages)",
+        "correctness",
+        rel,
+        all(n > 0 and k == n for k, n in timed.values()),
+        with_timing_of_200s=timed,
+    )
+    golden = {a: records.get(("golden", f"{rel}-{a}-golden"), {}) for a in ("a", "b")}
+    put(
+        f"{rel}: golden parity (all frames byte-identical) after the load, both arms",
+        "correctness",
+        rel,
+        all(g.get("valid") is True for g in golden.values()),
+        golden={a: g.get("problems", ["no record"]) for a, g in golden.items()},
+    )
+    for arm in ("a", "b"):
+        ready = records.get(("readiness", f"{rel}-{arm}"), {})
+        put(
+            f"{rel}: arm {arm.upper()} readiness poller ran (probes recorded)",
+            "harness",
+            rel,
+            ready.get("valid") is True,
+            probes=ready.get("probes"),
+            not_ready=ready.get("not_ready"),
+        )
+    if rel == "rel-diagmp":
+        mp = {k: (s or {}).get("multiprocess") or {} for k, s in sums.items()}
+        put(
+            f"{rel}: every load-worker process completed and reported its CPU",
+            "harness",
+            rel,
+            all(
+                m.get("workers") == params["load_workers"]
+                and not m.get("failed_workers")
+                and len(m.get("per_worker", [])) == params["load_workers"]
+                and all(w.get("cpu_pct_of_active_time") is not None for w in m["per_worker"])
+                for m in mp.values()
+            ),
+            workers={
+                k: [w.get("cpu_pct_of_active_time") for w in m.get("per_worker", [])]
+                for k, m in mp.items()
+            },
+        )
+    out[f"info: {rel} analysis (descriptive; see diag.json)"] = {
+        "status": "reported",
+        "kind": "info",
+        "counted": False,
+        "diag_json": (d / "diag.json").exists(),
+    }
+
+
+def _csv(path: Path) -> list[dict[str, str]]:
+    try:
+        return list(csv.DictReader(path.open()))
+    except OSError:
+        return []
+
+
+def _col_max(rows: list[dict[str, str]], col: str) -> float | None:
+    vals = [float(r[col]) for r in rows if r.get(col) not in (None, "")]
+    return max(vals) if vals else None
+
+
+def evaluate_rel(
+    d: Path,
+    rel: str,
+    params: dict[str, Any],
+    runs: list[tuple[str, int, int, int]],
+    records: dict[tuple[str, str], dict[str, Any]],
+    services: list[dict[str, Any]],
+    summ: Any,
+    put: Any,
+    out: dict[str, Any],
+) -> None:
+    threads, mif = params["rel_threads"], params["rel_max_in_flight"]
+    mine = [r for r in services if r.get("stage") in ("rel-ref", rel, "rel-serial")]
+    expected = [("rel-ref", 0), (rel, threads)] + (
+        [("rel-serial", 0)]
+        if any(r.get("stage") == "rel-serial" for r in mine)
+        or (rel == "rel-admission" and params["mode"] == "full")
+        else []
+    )
+    got = [(r.get("stage"), r.get("preprocess_threads_env")) for r in mine]
+    put(
+        f"{rel}: services ran with the intended settings (reference 0, parallel {threads}, "
+        f"max_in_flight {mif}), each in a fresh container",
+        "correctness",
+        rel,
+        got == expected
+        and all(r.get("max_in_flight") == mif for r in mine)
+        and len({r.get("container") for r in mine}) == len(mine),
+        services=got,
+        expected=expected,
+    )
+    labels = [label for label, *_ in runs if label != "rel-ref"]
+    sums = {label: summ(label) for label in labels}
+    # outputs: every 200 equals the serial reference; one output per input within each run
+    outputs = {label: (s or {}).get("outputs") for label, s in sums.items()}
+    put(
+        f"{rel}: every 200 response equals the serial reference for its input (canonical hash)",
+        "correctness",
+        rel,
+        all(
+            o is not None
+            and o.get("mismatches") == 0
+            and not o.get("inconsistent_inputs")
+            and o.get("checked", 0) > 0
+            for o in outputs.values()
+        ),
+        outputs={
+            k: v
+            if v is None
+            else {x: v.get(x) for x in ("checked", "mismatches", "inconsistent_inputs")}
+            for k, v in outputs.items()
+        },
+    )
+    golden = {
+        k[1]: v
+        for k, v in records.items()
+        if k[0] == "golden"
+        and k[1].startswith("rel-admission" if rel == "rel-admission" else "rel-sust-")
+    }
+    needed = 1 if rel == "rel-admission" else rel_blocks(params)
+    put(
+        f"{rel}: golden parity (all frames byte-identical) after "
+        + ("the stage" if rel == "rel-admission" else "every block"),
+        "correctness",
+        rel,
+        len(golden) == needed and all(g.get("valid") is True for g in golden.values()),
+        golden={
+            k: {"valid": g.get("valid"), "problems": g.get("problems")} for k, g in golden.items()
+        },
+        expected=needed,
+    )
+    ready_rows = _csv(d / f"{rel}.readiness.csv")
+    ready_rec = records.get(("readiness", rel), {})
+    not_ready = [r for r in ready_rows if r["http_status"] != "200" or r["status"] != "ready"]
+    put(
+        f"{rel}: /readyz continuously ready while the parallel service ran (timeouts = not ready)",
+        "correctness",
+        rel,
+        ready_rec.get("valid") is True and bool(ready_rows) and not not_ready,
+        probes=len(ready_rows),
+        not_ready=len(not_ready),
+    )
+    samples = _csv(d / f"{rel}.samples.csv")
+    peak_threads = _col_max(samples, "tree_threads")
+    budgets = params["rel_budgets"]
+    rss, gpu = _col_max(samples, "rss_mib"), _col_max(samples, "proc_gpu_mem_mib")
+    put(
+        f"{rel}: server threads <= {REL_THREADS_ACCEPT_MAX}, RSS <= {budgets['rss_mib']} MiB and "
+        f"GPU memory <= {budgets['gpu_mib']} MiB throughout",
+        "resource",
+        rel,
+        None
+        if peak_threads is None or rss is None or gpu is None
+        else peak_threads <= REL_THREADS_ACCEPT_MAX
+        and rss <= budgets["rss_mib"]
+        and gpu <= budgets["gpu_mib"],
+        peak_threads=peak_threads,
+        peak_rss_mib=rss,
+        peak_gpu_mib=gpu,
+    )
+    out[f"info: {rel} container pids (cgroup)"] = {
+        "status": "reported",
+        "kind": "info",
+        "counted": False,
+        "pids_current_max": _col_max(samples, "pids_current"),
+        "pids_max": next((r["pids_max"] for r in samples if r.get("pids_max")), None),
+    }
+    accounting = {
+        label: {
+            **(s.get("accounting") or {}),
+            "stop_reason": s.get("stop_reason"),
+            "outcomes": s.get("outcomes"),
+            "goodput_rps": round(s.get("throughput_rps", 0.0), 2),
+            "attempt_rate_rps": round(s.get("attempt_rate_rps", 0.0), 2),
+            "admitted_p50_ms": s["latency_ms"].get("p50"),
+            "admitted_p99_ms": s["latency_ms"].get("p99"),
+            "rejected_p50_ms": (s.get("latency_rejected_ms") or {}).get("p50"),
+        }
+        for label, s in sums.items()
+        if s
+    }
+    out[f"info: {rel} per-phase accounting"] = {
+        "status": "reported",
+        "kind": "info",
+        "counted": False,
+        "phases": accounting,
+    }
+    if rel == "rel-admission":
+        evaluate_rel_admission(params, sums, records, put)
+    else:
+        evaluate_rel_sustained(d, sums, put, out)
+
+
+def evaluate_rel_admission(
+    params: dict[str, Any], sums: dict[str, Any], records: Any, put: Any
+) -> None:
+    rel = "rel-admission"
+    base = sums.get("rel-base-c5")
+    calm = {k: v for k, v in sums.items() if k == "rel-base-c5" or k.endswith("-recovery")}
+    put(
+        f"{rel}: baseline C = 5 and every recovery run: every request ok (no rejection at 5)",
+        "correctness",
+        rel,
+        all(s is not None and set(s["outcomes"]) == {"ok"} for s in calm.values()),
+        outcomes={k: (s or {}).get("outcomes", "invalid run") for k, s in calm.items()},
+    )
+    over = {}
+    for spec in params["rel_overload"]:
+        c, m = spec.split(":")
+        over[f"rel-c{c}-{m}"] = sums.get(f"rel-c{c}-{m}")
+    put(
+        f"{rel}: overload phases return only 200 or 503 queue_full, every 503 with Retry-After: 1, "
+        "and at least one 200",
+        "correctness",
+        rel,
+        all(
+            s is not None
+            and set(s["outcomes"]) <= {"ok", "rejected"}
+            and s["outcomes"].get("ok", 0) > 0
+            and set(s["queue_full_retry_after"]) <= {"1"}
+            for s in over.values()
+        ),
+        phases={
+            k: {
+                "outcomes": (s or {}).get("outcomes"),
+                "retry_after": (s or {}).get("queue_full_retry_after"),
+            }
+            for k, s in over.items()
+        },
+    )
+    rec = {k: records.get(("recovery", k), {}) for k in over}
+    put(
+        f"{rel}: ready within {REL_RECOVERY_READY_S:.0f} s after every overload phase",
+        "correctness",
+        rel,
+        all(
+            r.get("ready") is True and r.get("ready_s", 99) <= REL_RECOVERY_READY_S
+            for r in rec.values()
+        ),
+        ready_s={k: r.get("ready_s") for k, r in rec.items()},
+    )
+    ref = (base or {}).get("latency_ms", {}).get("p99")
+    p99 = {k: (s or {}).get("latency_ms", {}).get("p99") for k, s in over.items()}
+    put(
+        f"{rel}: admitted p99 in every overload phase <= {REL_ADMITTED_P99_FACTOR:.0f} x the "
+        "baseline C = 5 p99 (same container)",
+        "correctness",
+        rel,
+        None
+        if ref is None or any(v is None for v in p99.values())
+        else all(v <= REL_ADMITTED_P99_FACTOR * ref for v in p99.values()),
+        baseline_p99_ms=ref,
+        overload_p99_ms=p99,
+    )
+
+
+def evaluate_rel_sustained(d: Path, sums: dict[str, Any], put: Any, out: dict[str, Any]) -> None:
+    rel = "rel-sustained"
+    put(
+        f"{rel}: every request ok in every block (C <= max_in_flight, so no rejection)",
+        "correctness",
+        rel,
+        bool(sums) and all(s is not None and set(s["outcomes"]) == {"ok"} for s in sums.values()),
+        outcomes={k: (s or {}).get("outcomes", "invalid run") for k, s in sums.items()},
+    )
+    an = load_json(d / "sustained.json") or {}
+    thr, gpu, rss, lat = (an.get(k, {}) for k in ("threads", "gpu", "rss", "latency"))
+    put(
+        f"{rel}: threads after warm-up: range <= {REL_THREADS_RANGE_MAX} and maximum <= "
+        f"{REL_THREADS_ACCEPT_MAX}",
+        "resource",
+        rel,
+        None
+        if thr.get("post_range") is None
+        else thr["post_range"] <= REL_THREADS_RANGE_MAX
+        and thr["post_max"] <= REL_THREADS_ACCEPT_MAX,
+        post_range=thr.get("post_range"),
+        post_max=thr.get("post_max"),
+    )
+    put(
+        f"{rel}: GPU memory after warm-up <= warm-up peak + {REL_GPU_GROWTH_MAX_MIB} MiB and <= "
+        f"{REL_GPU_TOTAL_MAX_MIB} MiB",
+        "resource",
+        rel,
+        None
+        if gpu.get("growth_after_warmup_mib") is None
+        else gpu["growth_after_warmup_mib"] <= REL_GPU_GROWTH_MAX_MIB
+        and gpu["post_max_mib"] <= REL_GPU_TOTAL_MAX_MIB,
+        growth_mib=gpu.get("growth_after_warmup_mib"),
+        post_max_mib=gpu.get("post_max_mib"),
+    )
+    tr = rss.get("trend_mib") or {}
+    ci = tr.get("ci95")
+    slope = tr.get("slope_per_h")
+    verdict: bool | None = None
+    if ci is not None:
+        verdict = (
+            True
+            if ci[1] <= REL_RSS_SLOPE_MAX_MIB_H
+            else (False if slope > REL_RSS_SLOPE_MAX_MIB_H else None)
+        )
+    put(
+        f"{rel}: RSS slope after warm-up, 95% CI upper bound <= {REL_RSS_SLOPE_MAX_MIB_H} MiB/h "
+        "(1-minute bins, autocorrelation-adjusted)",
+        "statistical",
+        rel,
+        verdict,
+        slope_mib_h=slope,
+        ci95=ci,
+        bins=tr.get("bins"),
+        n_effective=tr.get("n_effective"),
+    )
+    drift = lat.get("drift_ratio")
+    put(
+        f"{rel}: latency drift (median last / first window after warm-up) <= {REL_DRIFT_MAX}",
+        "statistical",
+        rel,
+        None if drift is None else drift <= REL_DRIFT_MAX,
+        drift_ratio=drift,
+    )
+    out[f"info: {rel} memory"] = {
+        "status": "reported",
+        "kind": "info",
+        "counted": False,
+        "rss": {k: v for k, v in rss.items() if k != "trend_mib"},
+        "gpu": gpu,
+    }
 
 
 def evaluate_ab(
@@ -415,9 +852,11 @@ def evaluate_ab(
         "correctness",
         "ab",
         all(g.get("valid") is True for g in golden.values()),
-        golden={k: {"valid": g.get("valid"), "problems": g.get("problems", ["no record"])}
-                for k, g in golden.items()},
-    )  # fmt: skip
+        golden={
+            k: {"valid": g.get("valid"), "problems": g.get("problems", ["no record"])}
+            for k, g in golden.items()
+        },
+    )
     ab = load_json(d / "ab.json")
     est = (ab or {}).get("estimates", {})
 
@@ -452,12 +891,29 @@ def evaluate_ab(
             verdict = True if hi <= limit else (False if ratio > limit else None)
         else:
             verdict = True if lo >= limit else (False if ratio < limit else None)
-        put(f"ab: {text} {op} {limit}", "statistical", "ab", verdict,
-            ratio=ratio, ci95=[lo, hi] if lo is not None else None,
-            pairs=est.get(metric, {}).get("pairs"))  # fmt: skip
-    for metric in ("c1_prep_p50_ms", "c8_prep_p50_ms", "c8_gpu_p50_ms", "c8_queue_p50_ms",
-                   "c1_p95_ms", "c1_p99_ms", "c8_p50_ms", "c8_p99_ms", "c1_rps",
-                   "c1_cpu_pct_mean", "c8_cpu_pct_mean", "c8_gpu_util_mean"):  # fmt: skip
+        put(
+            f"ab: {text} {op} {limit}",
+            "statistical",
+            "ab",
+            verdict,
+            ratio=ratio,
+            ci95=[lo, hi] if lo is not None else None,
+            pairs=est.get(metric, {}).get("pairs"),
+        )
+    for metric in (
+        "c1_prep_p50_ms",
+        "c8_prep_p50_ms",
+        "c8_gpu_p50_ms",
+        "c8_queue_p50_ms",
+        "c1_p95_ms",
+        "c1_p99_ms",
+        "c8_p50_ms",
+        "c8_p99_ms",
+        "c1_rps",
+        "c1_cpu_pct_mean",
+        "c8_cpu_pct_mean",
+        "c8_gpu_util_mean",
+    ):
         ratio, lo, hi = interval(metric)
         out[f"info: ab {metric} ratio B/A"] = {
             "status": "reported" if ratio is not None else "insufficient_data",

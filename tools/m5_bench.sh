@@ -25,6 +25,31 @@
 #              PILOT_DIR = a passing MODE=pilot ab run on the same image and AB_THREADS.
 #              Without FAULT_RETEST_DIR (M6 images) the verification run must be all PASS and
 #              include the parallel golden and container-recreation checks for AB_THREADS.
+#   rel-admission (M7) production max_in_flight 5. A serial container (threads 0) records the
+#              output reference of every input; then one parallel container (REL_THREADS):
+#              baseline C = 5 (REL_BASE_S), then each REL_OVERLOAD phase "C:noretry|honor"
+#              (REL_PHASE_S, cap REL_MAX_ATTEMPTS attempts), each followed by a recovery check
+#              (/readyz ready within 2 s, then 25 requests at C = 5 with no rejection); golden
+#              parity at the end. 0.5 s resource sampler and 1 s readiness poller throughout; stop
+#              conditions checked after every phase. MODE=pilot is C1, MODE=full is C2 (needs
+#              PILOT_DIR = passing C1 and FAULT_DIR = passing fault retest with REL_THREADS).
+#   rel-sustained (M7) serial reference, then one parallel container at C = REL_SUSTAINED_C
+#              honouring Retry-After for REL_SUSTAINED_S, in blocks of REL_BLOCK_S each followed by
+#              golden parity and the stop conditions; analysis tools/bench/sustained.py with
+#              REL_WARMUP_S excluded. MODE=pilot is C3 (needs PRIOR_DIR = passing C2), MODE=full
+#              is C4 (needs PILOT_DIR = passing C3 and SUSTAINED_AUTH=1).
+#   rel-diag   (M7 diagnostic, MODE=pilot only) serial reference, then arm A (threads 0) and arm B
+#              (REL_THREADS), each a fresh container with Server-Timing ON and max_in_flight 5:
+#              C = 5 baseline (REL_BASE_S) and the C = 32 no-retry burst (REL_PHASE_S, cap
+#              REL_MAX_ATTEMPTS), stop conditions, golden; analysis tools/bench/diag.py. Descriptive
+#              only; it authorizes nothing. Server-Timing differs from C1b (where it was off).
+#   rel-diagmp (M7 diagnostic 2, MODE=pilot only) as rel-diag, but every phase uses
+#              tools/bench/multiload.py: LOAD_WORKERS (4) client processes sharing the concurrency,
+#              one aggregate attempt cap and one deadline; the burst is paced to REL_DIAG_RATE
+#              attempts/s (250), the same offered schedule in both arms; at most 10 s and 1,000
+#              attempts. Per-worker CPU, achieved rate and in-flight concurrency are recorded.
+#              A rel stage must be the only stage of its run. Stop budgets REL_RSS_MAX_MIB (8192),
+#              REL_GPU_MAX_MIB (4096), REL_THREADS_MAX (400) can only be lowered.
 #
 #                   pilot  full (default)  allowed
 #   COLD_RUNS       1      3               1-5
@@ -35,6 +60,11 @@
 #   AB_TRIALS       4      12              multiple of 4, 4-16; AB_THREADS 12 (1-32)
 #   AB_C1_REQUESTS  20     100             1-500 (pilot <= 50); AB_C8_REQUESTS 40 / 200 (1-500)
 #   AB_WARMUP       5      20              0-100; AB_MAX_IN_FLIGHT 16 (8-32)
+#   REL_THREADS     12     12              1-32
+#   REL_BASE_S / REL_PHASE_S  10 / 10   30 / 30   5-60 s; REL_MAX_ATTEMPTS 1000 / 3000 (<= 10000)
+#   REL_OVERLOAD    "8:honor 32:noretry"    "8:noretry 8:honor 16:noretry 16:honor 32:noretry 32:honor"
+#   REL_SUSTAINED_S 600 (<= 900)  1800 (<= 3600); REL_WARMUP_S 120 / 300; REL_BLOCK_S 120 / 300
+#   REL_SUSTAINED_C 4 (1-5)
 #
 # Safety: requires the Stage A image id (EXPECT_IMAGE_ID, checked against the Stage A record and the
 # passing fault retest) and an image whose bevserve package equals this work tree. One Compose
@@ -58,7 +88,10 @@ NVIDIA_SMI=${NVIDIA_SMI:-nvidia-smi}
 # Golden comparison tool. Overriding it is for the fake-Docker tests only: it needs
 # BENCH_TEST_MODE=1, is recorded in meta.json, and a test-mode pilot never authorizes a full run.
 GOLDEN_TOOL=${GOLDEN_TOOL:-$REPO/tools/golden_http.py}
-TEST_MODE=${BENCH_TEST_MODE:-0}
+TEST_MODE=0   # test-mode runs (fakes or BENCH_TEST_MODE) can never authorize a later experiment
+if [ "${BENCH_TEST_MODE:-0}" = 1 ] || [[ "${DOCKER_CMD:-}" == */tests/* ]] || [ "$NVIDIA_SMI" != nvidia-smi ]; then
+  TEST_MODE=1
+fi
 export NVIDIA_SMI
 read -r -a DOCKER <<< "${DOCKER_CMD:-sudo docker}"
 d() { "${DOCKER[@]}" "$@"; }
@@ -84,6 +117,7 @@ cleanup() {
   trap - EXIT INT TERM
   exec 1>&3 2>&4
   stop_sampler
+  stop_ready
   service_down || true
   [ -n "$SUDO_KEEPALIVE" ] && kill "$SUDO_KEEPALIVE" 2>/dev/null
   if [ "$CLEANUP_FAILED" = 1 ]; then
@@ -103,9 +137,12 @@ trap 'exec 1>&3 2>&4; log "interrupted"; exit 130' INT TERM
 # ------------------------------------------------------------------- parameters and bounds
 case "$MODE" in
   pilot) P_COLD=1 P_LR=20 P_LW=5 P_OT=4 P_OR=20 P_OW=5 P_AL="8" P_AR=40 P_SR=20 P_SW=5 CAP=50
-         P_ABT=4 P_AB1=20 P_AB8=40 P_ABW=5 ;;
+         P_ABT=4 P_AB1=20 P_AB8=40 P_ABW=5
+         P_RB=10 P_RP=10 P_RMA=1000 P_RO="8:honor 32:noretry" P_RS=600 P_RSMAX=900 P_RW=120 P_RBL=120 ;;
   full)  P_COLD=3 P_LR=300 P_LW=20 P_OT=12 P_OR=100 P_OW=20 P_AL="8 16" P_AR=200 P_SR=100 P_SW=20 CAP=1000
-         P_ABT=12 P_AB1=100 P_AB8=200 P_ABW=20 ;;
+         P_ABT=12 P_AB1=100 P_AB8=200 P_ABW=20
+         P_RB=30 P_RP=30 P_RMA=3000 P_RO="8:noretry 8:honor 16:noretry 16:honor 32:noretry 32:honor"
+         P_RS=1800 P_RSMAX=3600 P_RW=300 P_RBL=300 ;;
   *) die "MODE must be pilot or full" ;;
 esac
 COLD_RUNS=${COLD_RUNS:-$P_COLD}
@@ -126,6 +163,21 @@ AB_C8_REQUESTS=${AB_C8_REQUESTS:-$P_AB8}
 AB_WARMUP=${AB_WARMUP:-$P_ABW}
 AB_MAX_IN_FLIGHT=${AB_MAX_IN_FLIGHT:-16}
 AB_SERVER_TIMING=${AB_SERVER_TIMING:-true}
+REL_THREADS=${REL_THREADS:-12}
+REL_BASE_S=${REL_BASE_S:-$P_RB}
+REL_PHASE_S=${REL_PHASE_S:-$P_RP}
+REL_MAX_ATTEMPTS=${REL_MAX_ATTEMPTS:-$P_RMA}
+REL_OVERLOAD=${REL_OVERLOAD:-$P_RO}
+REL_SUSTAINED_S=${REL_SUSTAINED_S:-$P_RS}
+REL_WARMUP_S=${REL_WARMUP_S:-$P_RW}
+REL_BLOCK_S=${REL_BLOCK_S:-$P_RBL}
+REL_SUSTAINED_C=${REL_SUSTAINED_C:-4}
+REL_RSS_MAX_MIB=${REL_RSS_MAX_MIB:-8192}
+REL_GPU_MAX_MIB=${REL_GPU_MAX_MIB:-4096}
+REL_THREADS_MAX=${REL_THREADS_MAX:-400}
+REL_MAX_IN_FLIGHT=5   # the production admission limit; not configurable for the rel stages
+LOAD_WORKERS=${LOAD_WORKERS:-4}
+REL_DIAG_RATE=${REL_DIAG_RATE:-250}
 bounded() {  # bounded NAME MIN MAX: integer within [MIN, MAX] or abort
   local v=${!1}
   [[ "$v" =~ ^[0-9]+$ ]] && (( 10#$v >= $2 && 10#$v <= $3 )) || die "$1=$v must be an integer in [$2, $3]"
@@ -149,6 +201,23 @@ bounded AB_C8_REQUESTS 1 "$SMALL_CAP"
 bounded AB_WARMUP 0 100
 bounded AB_MAX_IN_FLIGHT 8 32
 case "$AB_SERVER_TIMING" in true|false) ;; *) die "AB_SERVER_TIMING must be true or false" ;; esac
+bounded REL_THREADS 1 32
+bounded REL_BASE_S 5 60
+bounded REL_PHASE_S 5 60
+bounded REL_MAX_ATTEMPTS 1 10000
+bounded REL_SUSTAINED_S 60 "$P_RSMAX"
+bounded REL_WARMUP_S 30 "$(( REL_SUSTAINED_S / 2 ))"
+bounded REL_BLOCK_S 30 300
+bounded REL_SUSTAINED_C 1 5
+bounded REL_RSS_MAX_MIB 256 8192    # stop budgets can only be tightened
+bounded REL_GPU_MAX_MIB 256 4096
+bounded REL_THREADS_MAX 16 400
+bounded LOAD_WORKERS 2 8
+bounded REL_DIAG_RATE 50 500
+[ -n "$REL_OVERLOAD" ] || die "REL_OVERLOAD is empty"
+for spec in $REL_OVERLOAD; do
+  [[ "$spec" =~ ^(8|16|32):(noretry|honor)$ ]] || die "REL_OVERLOAD entries are C:noretry|honor with C in 8, 16, 32 ($spec)"
+done
 [ -n "$ADMISSION_LEVELS" ] || die "ADMISSION_LEVELS is empty"
 for c in $ADMISSION_LEVELS; do case "$c" in 8|16) ;; *) die "ADMISSION_LEVELS may contain only 8 and 16" ;; esac; done
 bounded SOAK_REQUESTS 1 "$CAP"
@@ -156,10 +225,22 @@ if (( SOAK_REQUESTS > 100 )) && [ "${SOAK_FULL:-0}" != 1 ]; then
   die "SOAK_REQUESTS=$SOAK_REQUESTS needs SOAK_FULL=1 (separate authorization for the full soak)"
 fi
 for stage in $STAGES; do
-  case "$stage" in cold|levels|overhead|admission|soak|ab) ;; *) die "unknown stage $stage" ;; esac
+  case "$stage" in cold|levels|overhead|admission|soak|ab|rel-admission|rel-sustained|rel-diag|rel-diagmp) ;; *) die "unknown stage $stage" ;; esac
 done
+REL=
+for stage in $STAGES; do case "$stage" in rel-*) REL=$stage ;; esac; done
+if [ -n "$REL" ] && [ "$STAGES" != "$REL" ]; then die "a rel stage must be the only stage of its run"; fi
+if [ "$REL" = rel-diag ] && [ "$MODE" != pilot ]; then die "STAGES=rel-diag runs only with MODE=pilot"; fi
+if [ "$REL" = rel-diagmp ]; then
+  [ "$MODE" = pilot ] || die "STAGES=rel-diagmp runs only with MODE=pilot"
+  (( REL_PHASE_S <= 10 && REL_MAX_ATTEMPTS <= 1000 )) || die "rel-diagmp: burst limited to 10 s and 1,000 attempts"
+  (( LOAD_WORKERS <= 5 )) || die "rel-diagmp: LOAD_WORKERS must not exceed the baseline concurrency 5"
+fi
+if [ "$REL" = rel-sustained ] && [ "$MODE" = full ]; then
+  [ "${SUSTAINED_AUTH:-0}" = 1 ] || die "MODE=full STAGES=rel-sustained (C4) needs SUSTAINED_AUTH=1 (separate authorization)"
+fi
 if [ "$GOLDEN_TOOL" != "$REPO/tools/golden_http.py" ]; then
-  [ "$TEST_MODE" = 1 ] || die "GOLDEN_TOOL may only be overridden with BENCH_TEST_MODE=1 (tests)"
+  [ "${BENCH_TEST_MODE:-0}" = 1 ] || die "GOLDEN_TOOL may only be overridden with BENCH_TEST_MODE=1 (tests)"
   log "WARNING: TEST MODE - golden comparison by $GOLDEN_TOOL; results are not benchmark evidence"
 fi
 
@@ -175,6 +256,18 @@ for var in "${DIRS[@]}"; do
   printf -v "$var" '%s' "$abs"
 done
 AB=0; [[ " $STAGES " == *" ab "* ]] && AB=1
+FAULT_DIR=${FAULT_DIR:-} PRIOR_DIR=${PRIOR_DIR:-}
+case "$REL:$MODE" in
+  rel-admission:full) for var in PILOT_DIR FAULT_DIR; do [ -n "${!var:-}" ] || die "C2 needs $var"; done ;;
+  rel-sustained:pilot) [ -n "$PRIOR_DIR" ] || die "C3 needs PRIOR_DIR (a passing C2 run)" ;;
+  rel-sustained:full) [ -n "${PILOT_DIR:-}" ] || die "C4 needs PILOT_DIR (a passing C3 run)" ;;
+esac
+for var in PILOT_DIR FAULT_DIR PRIOR_DIR; do
+  if [ -n "${!var:-}" ] && [ -n "$REL" ]; then
+    abs=$(cd "${!var}" 2>/dev/null && pwd) || die "$var is not a directory"
+    printf -v "$var" '%s' "$abs"
+  fi
+done
 if [ "$AB" = 1 ] && [ "$MODE" = full ]; then
   [ -n "${PILOT_DIR:-}" ] || die "MODE=full with stage ab needs PILOT_DIR (a passing MODE=pilot ab run)"
   PILOT_DIR=$(cd "$PILOT_DIR" 2>/dev/null && pwd) || die "PILOT_DIR is not a directory"
@@ -192,12 +285,28 @@ fi
 IMAGE_ID=$(d image inspect -f '{{.Id}}' "$IMAGE" 2>> "$LOG") || die "image $IMAGE not found"
 GATE=(--expect "$EXPECT_IMAGE_ID" --actual "$IMAGE_ID" --stage-a "$STAGE_A_DIR")
 if [ -n "$FAULT_RETEST_DIR" ]; then GATE+=(--retest "$FAULT_RETEST_DIR"); fi
+if [ -n "$REL" ]; then
+  GATE+=(--require "http-golden-parity with preprocess threads $REL_THREADS ("
+         --require "recreated container (new id) runs with BEVSERVE_PREPROCESS_THREADS=$REL_THREADS")
+fi
 if [ "$AB" = 1 ]; then
   GATE+=(--require "http-golden-parity with preprocess threads $AB_THREADS ("
          --require "recreated container (new id) runs with BEVSERVE_PREPROCESS_THREADS=$AB_THREADS")
 fi
 python3 "$REPO/tools/bench/verified_image.py" "${GATE[@]}" > "$OUT/verified-image.json" \
   || die "image is not the verified image (verified-image.json)"
+gate_prior() {  # gate_prior <dir> <mode> <stage> <output name>
+  python3 "$REPO/tools/bench/gate.py" prior --dir "$1" --image-id "$IMAGE_ID" --mode "$2" --stage "$3" \
+    --threads "$REL_THREADS" > "$OUT/$4" || die "earlier experiment did not pass ($4)"
+}
+case "$REL:$MODE" in
+  rel-admission:full)
+    gate_prior "$PILOT_DIR" pilot rel-admission gate-c1.json
+    python3 "$REPO/tools/bench/gate.py" fault --dir "$FAULT_DIR" --image-id "$IMAGE_ID" --threads "$REL_THREADS" \
+      > "$OUT/gate-fault.json" || die "fault retest did not pass (gate-fault.json)" ;;
+  rel-sustained:pilot) gate_prior "$PRIOR_DIR" full rel-admission gate-c2.json ;;
+  rel-sustained:full) gate_prior "$PILOT_DIR" pilot rel-sustained gate-c3.json ;;
+esac
 if [ "$AB" = 1 ] && [ "$MODE" = full ]; then
   python3 "$REPO/tools/bench/ab.py" pilot-gate --pilot "$PILOT_DIR" --image-id "$IMAGE_ID" \
     --threads "$AB_THREADS" > "$OUT/pilot-gate.json" || die "pilot did not pass (pilot-gate.json)"
@@ -213,6 +322,8 @@ d run --rm -i --network none --entrypoint python "$IMAGE" - package < "$REPO/too
 python3 "$REPO/tools/provenance.py" compare "$OUT/provenance-source.json" "$OUT/provenance-image.json" \
   > "$OUT/provenance-compare.json" || die "bevserve package in $IMAGE differs from the work tree (provenance-compare.json)"
 GIT_DESCRIBE=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['git_describe'])" "$OUT/provenance-source.json")
+N_INPUTS=${INPUTS##*:}   # number of distinct inputs (nuscenes:even:20 -> 20, synthetic:2 -> 2)
+[[ "$N_INPUTS" =~ ^[0-9]+$ ]] && (( N_INPUTS >= 1 )) || die "cannot derive the number of inputs from INPUTS=$INPUTS"
 ss -ltnH "( sport = :$PORT )" | grep -q . && die "port $PORT already in use"
 [ -z "$(d ps -aq --filter "label=com.docker.compose.project=$PROJECT")" ] || die "project $PROJECT exists"
 BUSY=$("$NVIDIA_SMI" --query-compute-apps=pid,used_memory --format=csv,noheader,nounits | awk -F', ' '$2 > 1024')
@@ -258,6 +369,14 @@ meta = {
     "ab_c8_requests": $AB_C8_REQUESTS, "ab_warmup": $AB_WARMUP,
     "ab_max_in_flight": $AB_MAX_IN_FLIGHT, "ab_server_timing": "$AB_SERVER_TIMING" == "true",
     "pilot_dir": "${PILOT_DIR:+$(basename "${PILOT_DIR:-}")}",
+    "rel_threads": $REL_THREADS, "rel_max_in_flight": $REL_MAX_IN_FLIGHT, "rel_base_s": $REL_BASE_S,
+    "rel_phase_s": $REL_PHASE_S, "rel_max_attempts": $REL_MAX_ATTEMPTS,
+    "rel_overload": "$REL_OVERLOAD".split(), "rel_sustained_s": $REL_SUSTAINED_S,
+    "rel_warmup_s": $REL_WARMUP_S, "rel_block_s": $REL_BLOCK_S, "rel_sustained_c": $REL_SUSTAINED_C,
+    "load_workers": $LOAD_WORKERS, "rel_diag_rate": $REL_DIAG_RATE,
+    "rel_budgets": {"rss_mib": $REL_RSS_MAX_MIB, "gpu_mib": $REL_GPU_MAX_MIB, "threads": $REL_THREADS_MAX},
+    "n_inputs": $N_INPUTS,
+    "gates": {"prior": "${PRIOR_DIR:+$(basename "${PRIOR_DIR:-}")}", "fault": "${FAULT_DIR:+$(basename "${FAULT_DIR:-}")}"},
   },
 }
 json.dump(meta, open(os.path.join(out, "meta.json"), "w"), indent=2)
@@ -347,6 +466,69 @@ bench() {  # bench <label> <concurrency> <requests> <warmup> [extra load.py args
     --concurrency "$c" --exit "$rc" >> "$RUNS" 2>> "$LOG" || { log "INVALID run $label (runs.jsonl)"; FAILED=1; }
 }
 readyz_to() { curl -s --max-time 5 "http://127.0.0.1:$PORT/readyz" > "$1" || : > "$1"; }
+READY= READY_LABEL= READY_T0=
+start_ready() {  # start_ready <label>: 1 s readiness poller
+  READY_LABEL=$1 READY_T0=$(date +%s.%N)
+  "$HOST_PY" "$REPO/tools/bench/readiness.py" --url "http://127.0.0.1:$PORT" --out "$OUT/$1.readiness.csv" \
+    --interval 1 --timeout 2 2>> "$LOG" &
+  READY=$!
+}
+stop_ready() {
+  [ -n "$READY" ] || return 0
+  local rc=0 t1
+  t1=$(date +%s.%N)
+  if kill -0 "$READY" 2>/dev/null; then kill -TERM "$READY" 2>/dev/null; wait "$READY" || rc=$?
+  else wait "$READY"; rc=$?; [ "$rc" = 0 ] && rc=99; fi
+  READY=
+  "$HOST_PY" "$REPO/tools/bench/validate.py" readiness --dir "$OUT" --label "$READY_LABEL" --exit "$rc" \
+    --t0 "$READY_T0" --t1 "$t1" >> "$RUNS" 2>> "$LOG" || { log "INVALID readiness record $READY_LABEL"; FAILED=1; }
+}
+bench_t() {  # bench_t <label> <concurrency> <seconds> <max attempts> [extra load.py args]: time-bounded
+  local label=$1 c=$2 secs=$3 cap=$4 rc=0 t0 t1; shift 4
+  t0=$(date +%s.%N)
+  "$HOST_PY" "$REPO/tools/bench/load.py" --url "http://127.0.0.1:$PORT" --concurrency "$c" --requests 1 \
+    --warmup 0 --duration "$secs" --max-attempts "$cap" --inputs "$INPUTS" --bevdet-root "$BEVDET_ROOT" \
+    --out "$OUT" --label "$label" --reference "$OUT/reference.json" "$@" > "$OUT/$label.client.txt" 2>> "$LOG" || rc=$?
+  t1=$(date +%s.%N)
+  tee -a "$LOG" < "$OUT/$label.client.txt"
+  record "{\"kind\": \"phase\", \"label\": \"$label\", \"window\": [$t0, $t1]}"
+  "$HOST_PY" "$REPO/tools/bench/validate.py" run --dir "$OUT" --label "$label" --requests "$cap" --warmup 0 \
+    --concurrency "$c" --exit "$rc" >> "$RUNS" 2>> "$LOG" || { log "INVALID run $label (runs.jsonl)"; FAILED=1; }
+}
+bench_mp() {  # bench_mp <label> <concurrency> <seconds> <max attempts> [multiload args]: multi-process client
+  local label=$1 c=$2 secs=$3 cap=$4 rc=0 t0 t1; shift 4
+  t0=$(date +%s.%N)
+  "$HOST_PY" "$REPO/tools/bench/multiload.py" --url "http://127.0.0.1:$PORT" --workers "$LOAD_WORKERS" \
+    --concurrency "$c" --duration "$secs" --max-attempts "$cap" --inputs "$INPUTS" --bevdet-root "$BEVDET_ROOT" \
+    --out "$OUT" --label "$label" --reference "$OUT/reference.json" "$@" > "$OUT/$label.client.txt" 2>> "$LOG" || rc=$?
+  t1=$(date +%s.%N)
+  tee -a "$LOG" < "$OUT/$label.client.txt"
+  record "{\"kind\": \"phase\", \"label\": \"$label\", \"window\": [$t0, $t1]}"
+  "$HOST_PY" "$REPO/tools/bench/validate.py" run --dir "$OUT" --label "$label" --requests "$cap" --warmup 0 \
+    --concurrency "$c" --exit "$rc" >> "$RUNS" 2>> "$LOG" || { log "INVALID run $label (runs.jsonl)"; FAILED=1; }
+}
+stop_check() {  # stop_check <sampler/readiness label> <since> [client labels]: abort on a stop condition
+  local label=$1 since=$2; shift 2
+  "$HOST_PY" "$REPO/tools/bench/budget.py" --dir "$OUT" --sampler "$label" --readiness "$label" --since "$since" \
+    --rss-max-mib "$REL_RSS_MAX_MIB" --gpu-max-mib "$REL_GPU_MAX_MIB" --threads-max "$REL_THREADS_MAX" \
+    --summaries "$@" >> "$OUT/stop-checks.jsonl" 2>> "$LOG" \
+    || die "stop condition reached: $(tail -1 "$OUT/stop-checks.jsonl")"
+}
+rel_reference() {  # serial container: the output reference of every input (threads 0, same image)
+  service_up rel-ref false "$REL_MAX_IN_FLIGHT" 0
+  bench rel-ref 1 "$N_INPUTS" 0 --write-reference "$OUT/reference.json"
+  [ -s "$OUT/reference.json" ] || die "serial reference was not recorded (rel-ref.summary.json)"
+  service_down || die "cleanup failed"
+}
+golden_check() {  # golden_check <label>
+  local rc=0
+  ( cd "$BEVDET_ROOT" && PYTHONDONTWRITEBYTECODE=1 "$HOST_PY" "$GOLDEN_TOOL" compare \
+      --url "http://127.0.0.1:$PORT" --golden "$GOLDEN_DIR/http_golden.json" ) \
+    > "$OUT/$1-golden_compare.json" 2> "$OUT/$1-golden_compare.stderr" || rc=$?
+  "$HOST_PY" "$REPO/tools/bench/validate.py" golden --label "$1-golden" --exit "$rc" \
+    --file "$OUT/$1-golden_compare.json" --golden "$GOLDEN_DIR/http_golden.json" >> "$RUNS" 2>> "$LOG" \
+    || { log "golden parity ($1): not executed or not passed (runs.jsonl)"; FAILED=1; }
+}
 
 # ------------------------------------------------------------------- stages
 for stage in $STAGES; do
@@ -418,6 +600,83 @@ for stage in $STAGES; do
     done
     "$HOST_PY" "$REPO/tools/bench/ab.py" analyze --dir "$OUT" --trials "$AB_TRIALS" > "$OUT/ab.json" \
       || { log "ab analysis failed"; FAILED=1; } ;;
+  rel-admission)
+    rel_reference
+    service_up rel-admission false "$REL_MAX_IN_FLIGHT" "$REL_THREADS"
+    T_STAGE=$(date +%s.%N)
+    start_sampler rel-admission 0.5; start_ready rel-admission
+    bench_t rel-base-c5 5 "$REL_BASE_S" "$REL_MAX_ATTEMPTS" --honor-retry-after
+    stop_check rel-admission "$T_STAGE" rel-base-c5
+    for spec in $REL_OVERLOAD; do
+      c=${spec%%:*} m=${spec##*:} extra=()
+      [ "$m" = honor ] && extra=(--honor-retry-after)
+      bench_t "rel-c$c-$m" "$c" "$REL_PHASE_S" "$REL_MAX_ATTEMPTS" "${extra[@]}"
+      t0=$(date +%s.%N) ok=0
+      for i in $(seq 1 20); do
+        [ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 1 "http://127.0.0.1:$PORT/readyz")" = 200 ] && { ok=1; break; }
+        sleep 0.1
+      done
+      ready_s=$(python3 -c "import time; print(round(time.time() - $t0, 3))")
+      record "{\"kind\": \"recovery\", \"label\": \"rel-c$c-$m\", \"ready\": $([ $ok = 1 ] && echo true || echo false), \"ready_s\": $ready_s}"
+      bench "rel-c$c-$m-recovery" 5 25 0 --reference "$OUT/reference.json"
+      stop_check rel-admission "$T_STAGE" "rel-c$c-$m" "rel-c$c-$m-recovery"
+    done
+    golden_check rel-admission
+    stop_ready; stop_sampler; service_down || die "cleanup failed"
+    if [ "$MODE" = full ]; then  # context only: the serial path at the same limit
+      service_up rel-serial false "$REL_MAX_IN_FLIGHT" 0
+      bench_t rel-serial-c16-honor 16 "$REL_PHASE_S" "$REL_MAX_ATTEMPTS" --honor-retry-after
+      service_down || die "cleanup failed"
+    fi ;;
+  rel-diag)
+    rel_reference
+    for arm in a b; do
+      if [ "$arm" = a ]; then threads=0; else threads=$REL_THREADS; fi
+      service_up "rel-diag-$arm" true "$REL_MAX_IN_FLIGHT" "$threads"
+      T_STAGE=$(date +%s.%N)
+      start_sampler "rel-diag-$arm" 0.5; start_ready "rel-diag-$arm"
+      bench_t "rel-diag-$arm-base-c5" 5 "$REL_BASE_S" "$REL_MAX_ATTEMPTS" --honor-retry-after
+      stop_check "rel-diag-$arm" "$T_STAGE" "rel-diag-$arm-base-c5"
+      bench_t "rel-diag-$arm-c32-noretry" 32 "$REL_PHASE_S" "$REL_MAX_ATTEMPTS"
+      stop_check "rel-diag-$arm" "$T_STAGE" "rel-diag-$arm-c32-noretry"
+      golden_check "rel-diag-$arm"
+      stop_ready; stop_sampler; service_down || die "cleanup failed"
+    done
+    "$HOST_PY" "$REPO/tools/bench/diag.py" --dir "$OUT" > "$OUT/diag.json" || { log "diag analysis failed"; FAILED=1; } ;;
+  rel-diagmp)
+    rel_reference
+    for arm in a b; do
+      if [ "$arm" = a ]; then threads=0; else threads=$REL_THREADS; fi
+      service_up "rel-diagmp-$arm" true "$REL_MAX_IN_FLIGHT" "$threads"
+      T_STAGE=$(date +%s.%N)
+      start_sampler "rel-diagmp-$arm" 0.5; start_ready "rel-diagmp-$arm"
+      bench_mp "rel-diagmp-$arm-base-c5" 5 "$REL_BASE_S" "$REL_MAX_ATTEMPTS" --honor-retry-after
+      stop_check "rel-diagmp-$arm" "$T_STAGE" "rel-diagmp-$arm-base-c5"
+      bench_mp "rel-diagmp-$arm-c32-noretry" 32 "$REL_PHASE_S" "$REL_MAX_ATTEMPTS" --rate "$REL_DIAG_RATE"
+      stop_check "rel-diagmp-$arm" "$T_STAGE" "rel-diagmp-$arm-c32-noretry"
+      golden_check "rel-diagmp-$arm"
+      stop_ready; stop_sampler; service_down || die "cleanup failed"
+    done
+    "$HOST_PY" "$REPO/tools/bench/diag.py" --dir "$OUT" --prefix rel-diagmp > "$OUT/diag.json" \
+      || { log "diag analysis failed"; FAILED=1; } ;;
+  rel-sustained)
+    rel_reference
+    service_up rel-sustained false "$REL_MAX_IN_FLIGHT" "$REL_THREADS"
+    T_STAGE=$(date +%s.%N)
+    start_sampler rel-sustained 1; start_ready rel-sustained
+    blocks=$(( (REL_SUSTAINED_S + REL_BLOCK_S - 1) / REL_BLOCK_S ))
+    record "{\"kind\": \"sustained\", \"label\": \"rel-sustained\", \"start\": $T_STAGE, \"blocks\": $blocks}"
+    for b in $(seq 1 "$blocks"); do
+      bench_t "rel-sust-b$b" "$REL_SUSTAINED_C" "$REL_BLOCK_S" "$(( REL_BLOCK_S * 100 ))" --honor-retry-after
+      golden_check "rel-sust-b$b"
+      stop_check rel-sustained "$T_STAGE" "rel-sust-b$b"
+    done
+    stop_ready; stop_sampler
+    REQS=(); for b in $(seq 1 "$blocks"); do REQS+=("$OUT/rel-sust-b$b.requests.jsonl"); done
+    "$HOST_PY" "$REPO/tools/bench/sustained.py" --samples "$OUT/rel-sustained.samples.csv" --requests "${REQS[@]}" \
+      --start "$T_STAGE" --warmup-s "$REL_WARMUP_S" --bin-s 60 > "$OUT/sustained.json" \
+      || { log "sustained analysis failed"; FAILED=1; }
+    service_down || die "cleanup failed" ;;
   esac
 done
 

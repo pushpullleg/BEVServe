@@ -4,13 +4,14 @@ HTTP inference service for camera-only 3D object detection with
 [BEVDet](https://github.com/HuangJunJie2017/BEVDet): six camera images plus calibration in, 3D
 boxes out.
 
-> **Status: milestone M6.** The service serves the released BEVDet-R50 checkpoint on a local GPU
+> **Status: milestone M7.** The service serves the released BEVDet-R50 checkpoint on a local GPU
 > (`BEVSERVE_DETECTOR=bevdet`), or a **FakeDetector** with fixed synthetic boxes (default).
 > Verified locally: over all 6,019 nuScenes val frames BEVServe's input path and adapter reproduce
 > the reference evaluation (mAP 0.3086, NDS 0.3941, identical to every printed digit), and HTTP
 > responses on 200 frames are identical to BEVDet's own evaluation path. The GPU container (M4) was
 > benchmarked on one workstation (M5), and an opt-in parallel preprocessing mode was verified and
-> benchmarked against it (M6, below).
+> benchmarked against it (M6, below). A reliability review (M7) kept serial preprocessing as the
+> default (decision: conditional; see below).
 
 ## What M1 contains
 
@@ -139,6 +140,26 @@ the variable for the container, for example in the Compose env file:
 ```bash
 BEVSERVE_PREPROCESS_THREADS=12   # 0 = serial (default); 1-32 = parallel; 12 is the benchmarked value
 ```
+
+## Reliability under overload (M7)
+
+Production admission limit 5, both preprocessing modes, verified M6 image
+([docs/m7-report.md](docs/m7-report.md)):
+
+- Fault recovery (exit 70, restart, recovery) and clean shutdown also hold with 12 threads.
+- Under overload the service returns only 200 or `503 queue_full` with `Retry-After: 1` and
+  `/readyz` stays healthy throughout; after the overload all five admission slots are free
+  again. Every successful response matched the serial reference, and the 10 golden frames stayed
+  byte-identical.
+- Limitation: when clients ignore `Retry-After` and offer about 5–7× capacity (~250 attempts/s),
+  latency of admitted requests rises: p99 270 ms serial and 254 ms with 12 threads, against
+  baselines of 198 and 110 ms (ratios 1.37× and 2.31×; one container per arm, no statistical
+  claim). The 12-thread mode is lower in absolute terms but misses the M7 criterion (at most 2× its
+  own baseline); the original M7 overload pilot also failed it. Sustained-load reliability has not
+  been measured.
+- Decision **conditional**: `BEVSERVE_PREPROCESS_THREADS=0` stays the default; 12 threads remains a
+  verified opt-in. An ingress-protection change (cheap rejection before parsing the upload) is
+  proposed, not implemented.
 
 ## API summary
 

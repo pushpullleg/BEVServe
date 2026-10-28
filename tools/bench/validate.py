@@ -4,6 +4,11 @@ r"""Execution records for M5 benchmark steps (one JSON line each, appended to RU
         --concurrency C --exit RC
     python tools/bench/validate.py sampler --dir D --label L --exit RC --t0 T0 --t1 T1
     python tools/bench/validate.py golden --file F --golden G --exit RC --label L
+    python tools/bench/validate.py readiness --dir D --label L --exit RC --t0 T0 --t1 T1
+
+Time-bounded runs (summary "mode": "duration"): --requests is the attempt cap; the run must have
+stopped for "duration" or "max_attempts", with one well-formed record per attempt, indices
+0..n-1 and n <= the cap.
 
 A record says whether the step *executed* correctly (the client exited 0 and wrote complete,
 well-formed results; the sampler ran throughout and attributed GPU memory to the serving process;
@@ -37,6 +42,8 @@ def check_run(
         return [*problems, f"results missing or malformed ({type(exc).__name__})"]
     if not isinstance(summary, dict) or summary.get("label") != label:
         return [*problems, "summary is not for this label"]
+    if summary.get("mode") == "duration":
+        return problems + check_timed_run(summary, rows, requests, warmup, concurrency)
     if len(rows) != requests + warmup:
         problems.append(f"{len(rows)} request records, expected {requests + warmup}")
     if sorted(r.get("i") for r in rows) != list(range(requests + warmup)):
@@ -51,6 +58,50 @@ def check_run(
     if not isinstance(outcomes, dict) or sum(outcomes.values()) != requests:
         problems.append("outcome counts do not cover the measured requests")
     return problems
+
+
+def check_timed_run(
+    summary: dict[str, Any], rows: list[dict[str, Any]], cap: int, warmup: int, concurrency: int
+) -> list[str]:
+    problems = []
+    n = len(rows)
+    if summary.get("stop_reason") not in ("duration", "max_attempts"):
+        problems.append(f"run stopped for {summary.get('stop_reason')!r}")
+    if n == 0 or n > cap or summary.get("attempts_total") != n:
+        problems.append(f"{n} request records for an attempt cap of {cap}")
+    if sorted(r.get("i") for r in rows) != list(range(n)):
+        problems.append("request indices incomplete")
+    if any(not isinstance(r.get("status"), int) or "latency_ms" not in r for r in rows):
+        problems.append("request record without status or latency")
+    acct = summary.get("accounting") or {}
+    if summary.get("warmup") != warmup or acct.get("attempts") != max(0, n - warmup):
+        problems.append("summary counts differ from the records")
+    if summary.get("concurrency") != concurrency:
+        problems.append("summary concurrency differs from the plan")
+    outcomes = summary.get("outcomes")
+    if not isinstance(outcomes, dict) or sum(outcomes.values()) != acct.get("attempts"):
+        problems.append("outcome counts do not cover the measured attempts")
+    if (summary.get("outputs") or {}).get("reference_error"):
+        problems.append(summary["outputs"]["reference_error"])
+    return problems
+
+
+def check_readiness(
+    d: Path, label: str, rc: int, t0: float, t1: float
+) -> tuple[list[str], dict[str, Any]]:
+    problems = [] if rc == 0 else [f"readiness poller exited {rc}"]
+    try:
+        rows = list(csv.DictReader((d / f"{label}.readiness.csv").open()))
+    except OSError as exc:
+        return [*problems, f"readiness record missing ({type(exc).__name__})"], {}
+    times = [t0, *(float(r["t_unix"]) for r in rows), t1]
+    max_gap = max(b - a for a, b in itertools.pairwise(times))
+    if not rows:
+        problems.append("no readiness probes")
+    elif max_gap > 5.0:  # 1 s interval + 2 s probe timeout + slack
+        problems.append(f"readiness probing gap of {max_gap:.1f} s")
+    not_ready = sum(1 for r in rows if r["http_status"] != "200" or r["status"] != "ready")
+    return problems, {"probes": len(rows), "not_ready": not_ready, "max_gap_s": round(max_gap, 2)}
 
 
 def check_sampler(
@@ -108,7 +159,7 @@ def check_golden(f: Path, golden: Path, rc: int) -> tuple[list[str], dict[str, A
 
 def main() -> int:
     p = argparse.ArgumentParser()
-    p.add_argument("kind", choices=["run", "sampler", "golden"])
+    p.add_argument("kind", choices=["run", "sampler", "golden", "readiness"])
     p.add_argument("--dir")
     p.add_argument("--label", required=True)
     p.add_argument("--exit", type=int, required=True)
@@ -125,6 +176,8 @@ def main() -> int:
         problems = check_run(Path(a.dir), a.label, a.requests, a.warmup, a.concurrency, a.exit)
     elif a.kind == "sampler":
         problems, evidence = check_sampler(Path(a.dir), a.label, a.exit, a.t0, a.t1)
+    elif a.kind == "readiness":
+        problems, evidence = check_readiness(Path(a.dir), a.label, a.exit, a.t0, a.t1)
     else:
         problems, evidence = check_golden(Path(a.file), Path(a.golden), a.exit)
     record = {

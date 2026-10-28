@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# Fake `docker` for orchestration tests of tools/m5_fault_retest.sh (no Docker daemon, no GPU).
+# `compose up` runs `python -m bevserve.faultinject --fatal-on-call 2` (FakeDetector) under a
+# supervisor loop that mimics `restart: on-failure` and records die/start events with nanosecond
+# times; `events` applies the daemon's window rule (events later than --until are dropped);
+# `compose stop` sends SIGTERM and records the exit code (PID 1 signal semantics, see below);
+# FAKE_ENV_THREADS=N misreports the container's BEVSERVE_PREPROCESS_THREADS.
+set -u
+echo "docker $*" >> "$FAKE_STATE/calls.log"
+ST=$FAKE_STATE
+FULLID=fa11fa11fa11fa11fa11fa11fa11fa11fa11fa11fa11fa11fa11fa11fa11fa11
+IMAGE_ID=sha256:$(printf 'f%.0s' {1..64})
+case "$1" in
+  image) echo "$IMAGE_ID" ;;
+  run) exec "$FAKE_PY" - package ;;
+  inspect)
+    case "$*" in
+      *RestartCount*) cat "$ST/restarts" ;;
+      *RestartPolicy*) echo on-failure:5 ;;
+      *ExitCode*) cat "$ST/exitcode" 2>/dev/null || echo 255 ;;
+      *".Config.Env"*)
+        grep '^BEVSERVE_' "$ST/env" | grep -v '^BEVSERVE_PREPROCESS_THREADS='
+        echo "BEVSERVE_PREPROCESS_THREADS=${FAKE_ENV_THREADS:-$(sed -n 's/^BEVSERVE_PREPROCESS_THREADS=//p' "$ST/env" | tail -1)}" ;;
+      *.Id*) echo "$FULLID" ;;
+    esac ;;
+  logs) cat "$ST/server.log" ;;
+  ps) if [ -f "$ST/up" ]; then echo "$FULLID"; fi ;;
+  events)
+    since=$(sed -E 's/.*--since ([^ ]+).*/\1/' <<< "$*"); until=$(sed -E 's/.*--until ([^ ]+).*/\1/' <<< "$*")
+    now=$(date +%s.%N); sleep "$(python3 -c "print(max(0, $until - $now))")"
+    python3 - "$since" "$until" "$ST/events.jsonl" <<'PY'
+import json, sys
+since, until = (int(float(x) * 1e9) for x in sys.argv[1:3])
+for line in open(sys.argv[3]):
+    if since <= json.loads(line)["timeNano"] <= until:
+        print(line, end="")
+PY
+    ;;
+  compose)
+    case " $* " in
+      *" up "*)
+        envf=$(sed -E 's/.*--env-file ([^ ]+).*/\1/' <<< "$*")
+        cp "$envf" "$ST/env"
+        set -a; . "$envf"; set +a
+        echo 0 > "$ST/restarts"; : > "$ST/events.jsonl"; touch "$ST/up"; rm -f "$ST/down" "$ST/exitcode"
+        export ST FULLID
+        BEVSERVE_PORT=$BEVSERVE_HOST_PORT BEVSERVE_FAULT_INJECTION_ACK=1 setsid bash -c '
+          ev() { printf "{\"Type\":\"container\",\"Action\":\"%s\",\"id\":\"%s\",\"Actor\":{\"ID\":\"%s\",\"Attributes\":{%s}},\"timeNano\":%s}\n" \
+                   "$1" "$FULLID" "$FULLID" "$2" "$(date +%s%N)" >> "$ST/events.jsonl"; }
+          ev start "\"name\":\"fake\""
+          # Emulate PID 1 in a container: the kernel ignores default-action signals sent to PID 1,
+          # so the SIGTERM uvicorn re-raises after its graceful shutdown does not kill it there.
+          # Starting the server with SIGTERM ignored reproduces that (uvicorn still installs its
+          # own handler); a server that never handled SIGTERM would not stop at all.
+          trap "" TERM
+          while true; do
+            "$FAKE_PY" -m bevserve.faultinject --fatal-on-call 2 >> "$ST/server.log" 2>&1 &
+            echo $! > "$ST/server.pid"; wait $!; rc=$?
+            echo $rc > "$ST/exitcode"; ev die "\"exitCode\":\"$rc\""
+            if [ -f "$ST/down" ] || [ "$rc" = 0 ]; then exit 0; fi
+            sleep 0.1; echo $(( $(cat "$ST/restarts") + 1 )) > "$ST/restarts"; ev start "\"name\":\"fake\""
+          done' > /dev/null 2>&1 < /dev/null 3>&- 4>&- &
+        echo $! > "$ST/pid" ;;
+      *" logs "*) cat "$ST/server.log" ;;
+      *" ps "*) if [ -f "$ST/up" ]; then echo fakecid; fi ;;
+      *" stop "*)
+        touch "$ST/down"
+        if [ -f "$ST/server.pid" ]; then kill -TERM "$(cat "$ST/server.pid")" 2>/dev/null; fi
+        for _ in $(seq 1 100); do kill -0 "$(cat "$ST/pid")" 2>/dev/null || break; sleep 0.1; done ;;
+      *" down "*)
+        touch "$ST/down"; rm -f "$ST/up"
+        if [ -f "$ST/server.pid" ]; then kill -TERM "$(cat "$ST/server.pid")" 2>/dev/null; fi
+        for _ in $(seq 1 100); do kill -0 "$(cat "$ST/pid")" 2>/dev/null || break; sleep 0.1; done
+        pkill -KILL -s "$(cat "$ST/pid")" 2>/dev/null; true ;;
+    esac ;;
+  *) exit 0 ;;
+esac

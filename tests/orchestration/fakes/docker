@@ -3,6 +3,7 @@
 # "compose up" starts a local FakeDetector bevserve from the env file; state lives in $FAKE_STATE.
 # FAKE_DOWN_FAIL=1 makes `compose down` fail and leave the service running (cleanup-failure test).
 # FAKE_ENV_THREADS=N makes `inspect` report BEVSERVE_PREPROCESS_THREADS=N whatever was configured.
+# The service is fake_server.py (the real app with a FakeDetector and optional failure knobs).
 set -u
 echo "docker $*" >> "$FAKE_STATE/calls.log"
 IMAGE_ID=sha256:$(printf 'f%.0s' {1..64})
@@ -32,8 +33,7 @@ case "$1" in
         cp "$envf" "$FAKE_STATE/env"
         grep -q '^BEVSERVE_PREPROCESS_THREADS=' "$FAKE_STATE/env" || echo "BEVSERVE_PREPROCESS_THREADS=0" >> "$FAKE_STATE/env"
         set -a; . "$envf"; set +a
-        BEVSERVE_PORT=$BEVSERVE_HOST_PORT setsid "$FAKE_PY" -c \
-          "import sys; from bevserve.cli import main; sys.exit(main())" \
+        BEVSERVE_PORT=$BEVSERVE_HOST_PORT setsid "$FAKE_PY" "$(dirname "$0")/fake_server.py" \
           >> "$FAKE_STATE/server.log" 2>&1 < /dev/null 3>&- 4>&- &   # no inherited pipes
         echo $! > "$FAKE_STATE/pid" ;;
       *" ps "*) if running; then echo fakecontainer; fi ;;

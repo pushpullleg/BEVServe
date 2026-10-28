@@ -7,7 +7,12 @@ serving process died during sampling). Columns: wall time, process RSS (MiB), pr
 threads; 100 = one core), threads, GPU utilization % and memory used (whole GPU), the GPU memory of
 the serving process (nvidia-smi compute apps whose PID is the target or one of its descendants,
 host PID namespace), and gpu_status: ok | query_failed | not_listed | unavailable. A value that
-nvidia-smi cannot provide is left empty (missing), never written as zero.
+nvidia-smi cannot provide is left empty (missing), never written as zero. M7 adds tree_threads
+(threads of the target and its descendants) and the container's cgroup pids.current / pids.max
+(tasks = threads, the quantity Compose's `pids` limit bounds; empty if not readable).
+M7 diagnostic adds per-thread CPU of the target process: main_thread_cpu_pct (the thread whose id
+equals the process id; uvicorn's event loop runs there) and max_thread_cpu_pct (the busiest single
+thread in the interval). 100 = one core. They show load per thread, not lock contention.
 
 For a container, pass the host PID of its main process (`docker inspect -f '{{.State.Pid}}'`).
 The --meta sidecar records the target, the GPU PIDs attributed to it, the sample count and the exit
@@ -63,6 +68,62 @@ def process_tree(pid: int) -> set[int]:
         tree.update(children)
         frontier.extend(children)
     return tree
+
+
+def thread_ticks(pid: int) -> dict[int, int]:
+    """utime + stime (clock ticks) of every thread of the process."""
+    out: dict[int, int] = {}
+    try:
+        tids = os.listdir(f"/proc/{pid}/task")
+    except OSError:
+        return out
+    for tid in tids:
+        try:
+            with open(f"/proc/{pid}/task/{tid}/stat") as f:
+                fields = f.read().rsplit(")", 1)[1].split()
+            out[int(tid)] = int(fields[11]) + int(fields[12])
+        except (OSError, IndexError, ValueError):
+            continue
+    return out
+
+
+def thread_cpu(
+    pid: int, before: dict[int, int], after: dict[int, int], seconds: float
+) -> tuple[str, str]:
+    """(main-thread CPU %, busiest-thread CPU %) over an interval, or ("", "") if unknown."""
+    if not after or seconds <= 0:
+        return "", ""
+    deltas = {t: after[t] - before.get(t, after[t]) for t in after}
+    main = deltas.get(pid)
+    busiest = max(deltas.values(), default=None)
+    pct = lambda ticks: f"{100 * ticks / CLK / seconds:.1f}"  # noqa: E731
+    return (pct(main) if main is not None else ""), (pct(busiest) if busiest is not None else "")
+
+
+def tree_threads(tree: set[int]) -> int | None:
+    total = 0
+    for pid in tree:
+        try:
+            with open(f"/proc/{pid}/status") as f:
+                total += int(next(line.split()[1] for line in f if line.startswith("Threads:")))
+        except (OSError, StopIteration, ValueError):
+            continue
+    return total or None
+
+
+def cgroup_pids(pid: int) -> tuple[str, str]:
+    """(pids.current, pids.max) of the target's cgroup v2, or ("", "") if unavailable."""
+    try:
+        with open(f"/proc/{pid}/cgroup") as f:
+            path = next(line.strip().split("::", 1)[1] for line in f if line.startswith("0::"))
+        base = f"/sys/fs/cgroup{path}"
+        with open(f"{base}/pids.current") as f:
+            current = f.read().strip()
+        with open(f"{base}/pids.max") as f:
+            limit = f.read().strip()
+        return current, limit
+    except (OSError, StopIteration, IndexError):
+        return "", ""
 
 
 def number(text: str) -> str:
@@ -133,9 +194,15 @@ def main() -> int:
                 "gpu_mem_used_mib",
                 "proc_gpu_mem_mib",
                 "gpu_status",
+                "tree_threads",
+                "pids_current",
+                "pids_max",
+                "main_thread_cpu_pct",
+                "max_thread_cpu_pct",
             ]
         )
         prev = proc_sample(args.pid)
+        prev_threads = thread_ticks(args.pid)
         prev_t = time.monotonic()
         if prev is None:
             reason = "target_not_found"
@@ -149,7 +216,11 @@ def main() -> int:
                 break
             now = time.monotonic()
             cpu_pct = 100 * (cur[2] - prev[2]) / (now - prev_t)
-            util, used, own, status, pids = gpu_sample(process_tree(args.pid))
+            ticks = thread_ticks(args.pid)
+            main_cpu, max_cpu = thread_cpu(args.pid, prev_threads, ticks, now - prev_t)
+            tree = process_tree(args.pid)
+            util, used, own, status, pids = gpu_sample(tree)
+            threads_all = tree_threads(tree)
             statuses[status] = statuses.get(status, 0) + 1
             gpu_pids.update(pids)
             out.writerow(
@@ -162,11 +233,15 @@ def main() -> int:
                     used,
                     own,
                     status,
+                    threads_all or "",
+                    *cgroup_pids(args.pid),
+                    main_cpu,
+                    max_cpu,
                 ]
             )
             f.flush()
             n += 1
-            prev, prev_t = cur, now
+            prev, prev_t, prev_threads = cur, now, ticks
     meta.update(
         t_stop_unix=time.time(),
         samples=n,

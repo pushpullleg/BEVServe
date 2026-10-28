@@ -8,6 +8,10 @@
 # fault injection (call 2 is fatal): call 1 -> 200, call 2 -> 500 inference_fatal; the Docker die
 # event of that container carries exitCode 70 (daemon evidence, not logs or restart count); Docker
 # restarts it exactly once; ready again; a request after recovery -> 200; no further restarts.
+# PREPROCESS_THREADS (default 0; M7: 12) is passed to the service and verified from the running
+# container; the run ends with a clean-shutdown check (compose stop -> exit code 0). run.json
+# records the image id, the setting and whether this was a test-mode run (fake Docker or
+# BENCH_TEST_MODE); only non-test runs can authorize later experiments (tools/bench/gate.py).
 #
 # Safety: `sudo docker` only for this run's own Compose project bevserve-m5fault-<run id>; cleanup
 # (logs saved first, then down with the same -p/-f/--env-file) on exit and Ctrl-C; no build, prune,
@@ -22,7 +26,11 @@ PROJECT=bevserve-m5fault-$RUN_ID
 PORT=${PORT:-8000}
 GPU=${GPU:-0}
 CKPT_FILE=${CKPT_FILE:-bevdet-r50-cbgs.pth}
+PREPROCESS_THREADS=${PREPROCESS_THREADS:-0}
 read -r -a DOCKER <<< "${DOCKER_CMD:-sudo docker}"
+NVIDIA_SMI=${NVIDIA_SMI:-nvidia-smi}
+TEST_MODE=0
+if [ "${BENCH_TEST_MODE:-0}" = 1 ] || [[ "${DOCKER_CMD:-}" == */tests/* ]] || [ "$NVIDIA_SMI" != nvidia-smi ]; then TEST_MODE=1; fi
 d() { "${DOCKER[@]}" "$@"; }
 OUT=$REPO/outputs/m5-fault-$RUN_ID
 mkdir -p "$OUT" && chmod 700 "$OUT"
@@ -71,6 +79,7 @@ trap 'exec 1>&3 2>&4; log "interrupted"; exit 130' INT TERM
 # ------------------------------------------------------------------- inputs and prerequisites
 log "== inputs and prerequisites (run $RUN_ID, project $PROJECT, image ${IMAGE:-unset})"
 for var in IMAGE CKPT_DIR CKPT_SHA256 HOST_PY; do [ -n "${!var:-}" ] || die "input: $var is not set"; done
+[[ "$PREPROCESS_THREADS" =~ ^[0-9]+$ ]] && (( PREPROCESS_THREADS <= 32 )) || die "input: PREPROCESS_THREADS must be 0-32"
 CKPT_DIR=$(cd "$CKPT_DIR" 2>/dev/null && pwd) || die "input: CKPT_DIR is not a directory"
 case "$HOST_PY" in /*) ;; *) HOST_PY=$(realpath -s "$HOST_PY") ;; esac
 "$HOST_PY" -c "import httpx" > /dev/null 2>&1 || die "input: HOST_PY lacks httpx"
@@ -81,12 +90,14 @@ if [[ "${DOCKER[0]}" == sudo ]]; then
 fi
 IMAGE_ID=$(d image inspect -f '{{.Id}}' "$IMAGE" 2>> "$LOG") || die "prerequisite: image $IMAGE not found"
 echo "image $IMAGE id $IMAGE_ID" >> "$LOG"
+printf '{"run_id": "%s", "image_id": "%s", "preprocess_threads": %s, "test_mode": %s}\n' \
+  "$RUN_ID" "$IMAGE_ID" "$PREPROCESS_THREADS" "$([ "$TEST_MODE" = 1 ] && echo true || echo false)" > "$OUT/run.json"
 if [ -n "${EXPECT_IMAGE_ID:-}" ]; then
   [ "$IMAGE_ID" = "$EXPECT_IMAGE_ID" ] && pass "image id is the verified $IMAGE_ID" || die "image id $IMAGE_ID != EXPECT_IMAGE_ID"
 fi
 if ss -ltnH "( sport = :$PORT )" | grep -q .; then die "prerequisite: port $PORT already in use"; fi
 [ -z "$(d ps -aq --filter "label=com.docker.compose.project=$PROJECT")" ] || die "prerequisite: project $PROJECT exists"
-BUSY=$(nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader,nounits | awk -F', ' '$2 > 1024')
+BUSY=$("$NVIDIA_SMI" --query-compute-apps=pid,used_memory --format=csv,noheader,nounits | awk -F', ' '$2 > 1024')
 [ -z "$BUSY" ] || die "prerequisite: another GPU workload is running ($BUSY)"
 
 # ------------------------------------------------------------------- provenance
@@ -113,6 +124,7 @@ BEVSERVE_CHECKPOINT_SHA256=$CKPT_SHA256
 BEVSERVE_HOST_PORT=$PORT
 BEVSERVE_GPU=$GPU
 BEVSERVE_GIT_COMMIT=$GIT_DESCRIBE
+BEVSERVE_PREPROCESS_THREADS=$PREPROCESS_THREADS
 EOF
 cat > "$OVERRIDE" <<'EOF'
 services:
@@ -125,6 +137,10 @@ UP=1
 d "${DC[@]}" up -d --no-build >> "$LOG" 2>&1 || die "compose up"
 FID=$(d "${DC[@]}" ps -q bevserve) && [ -n "$FID" ] && FID=$(d inspect -f '{{.Id}}' "$FID") || die "container id"
 secs=$(wait_ready 240) && pass "startup-ready (${secs} s)" || die "startup-ready"
+ENV_THREADS=$(d inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$FID" | sed -n 's/^BEVSERVE_PREPROCESS_THREADS=//p')
+[ "$ENV_THREADS" = "$PREPROCESS_THREADS" ] \
+  && pass "container runs with BEVSERVE_PREPROCESS_THREADS=$PREPROCESS_THREADS" \
+  || die "container runs with BEVSERVE_PREPROCESS_THREADS=${ENV_THREADS:-unset}, expected $PREPROCESS_THREADS"
 POLICY=$(d inspect -f '{{.HostConfig.RestartPolicy.Name}}:{{.HostConfig.RestartPolicy.MaximumRetryCount}}' "$FID")
 [ "$POLICY" = "on-failure:5" ] && pass "restart-policy ($POLICY)" || fail "restart-policy ($POLICY)"
 
@@ -175,4 +191,9 @@ grep -q -x '200:ok' "$OUT/recovery_request.txt" && pass "request after recovery 
 sleep 10
 RC2=$(d inspect -f '{{.RestartCount}}' "$FID")
 [ "$RC2" = "$RC1" ] && pass "no further restarts (restart count $RC2 after 10 s)" || fail "further restarts ($RC1 -> $RC2)"
+t0=$SECONDS
+d "${DC[@]}" stop >> "$LOG" 2>&1
+CODE=$(d inspect -f '{{.State.ExitCode}}' "$FID" 2>> "$LOG")
+[ "$CODE" = 0 ] && pass "clean shutdown with BEVSERVE_PREPROCESS_THREADS=$PREPROCESS_THREADS (exit 0 in $((SECONDS - t0)) s)" \
+  || fail "clean shutdown with BEVSERVE_PREPROCESS_THREADS=$PREPROCESS_THREADS (exit ${CODE:-unknown})"
 log "done"

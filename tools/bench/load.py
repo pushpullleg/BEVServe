@@ -12,6 +12,21 @@ Writes DIR/<label>.requests.jsonl (one line per measured request) and DIR/<label
 Latency percentiles use the nearest-rank method; 95% intervals come from a 2,000-resample
 bootstrap (seed 0). Throughput = successful responses / measurement wall time.
 nuScenes inputs are read locally and never written anywhere; outputs contain no image data.
+
+Time-bounded mode (M7): `--duration S --max-attempts N` sends requests until S seconds have passed
+or N attempts (warm-up included) were made, whichever comes first; requests in flight at the end
+finish within --timeout, and a hard stop at S + timeout + 5 s cancels anything left. SIGINT and
+SIGTERM stop new requests the same way; the run is then marked interrupted and exits 3.
+
+Output checks (M7): every 200 response gets `output_sha256`, a hash of its canonical semantic
+content (model identity, frame, units and boxes; JSON re-serialized with sorted keys and fixed
+separators, so formatting cannot cause a mismatch; request id and timings excluded).
+`--write-reference F` stores the hash per input (each input must give one hash); `--reference F`
+compares every 200 response with it (same input set required, checked by request-body hashes).
+
+Accounting: attempts (requests sent), completed (an HTTP response arrived), rejected (503
+queue_full, i.e. refused by admission), accepted (completed and not rejected), success (200 with a
+valid body). Latency is reported separately for successful and for rejected requests.
 """
 
 from __future__ import annotations
@@ -19,8 +34,11 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import hashlib
 import json
 import platform
+import resource
+import signal
 import sys
 import time
 from pathlib import Path
@@ -90,6 +108,27 @@ def load_inputs(
     raise SystemExit(f"unknown input spec {spec!r}")
 
 
+def canonical_output(doc: dict[str, Any]) -> str:
+    """sha256 of the semantically meaningful part of a 200 response (see module docstring)."""
+    model = doc.get("model") or {}
+    content = {
+        "model": {k: model.get(k) for k in ("name", "checkpoint_sha256", "config_sha256")},
+        "frame": doc["frame"],
+        "units": doc.get("units"),
+        "boxes": doc["boxes"],
+    }
+    text = json.dumps(content, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def body_hashes(bodies: list[tuple[bytes, str]]) -> list[str]:
+    """Identity of each input, independent of the multipart boundary chosen at encoding."""
+    return [
+        hashlib.sha256(b.replace(c.split("boundary=")[1].encode(), b"")).hexdigest()
+        for b, c in bodies
+    ]
+
+
 def parse_server_timing(header: str | None) -> dict[str, float]:
     out: dict[str, float] = {}
     for item in (header or "").split(","):
@@ -101,23 +140,45 @@ def parse_server_timing(header: str | None) -> dict[str, float]:
 
 async def run(
     args: argparse.Namespace, bodies: list[tuple[bytes, str]]
-) -> tuple[list[dict[str, Any]], float]:
+) -> tuple[list[dict[str, Any]], float, str]:
+    """(rows, seconds, stop reason: requests, duration, max_attempts, interrupted, hard_stop)."""
     limits = httpx.Limits(
         max_connections=args.concurrency, max_keepalive_connections=args.concurrency
     )
     timeout = httpx.Timeout(args.timeout)
     rows: list[dict[str, Any]] = []
     counter = {"next": 0}
-    total = args.warmup + args.requests
+    timed = args.duration is not None
+    total = args.max_attempts if timed else args.warmup + args.requests
+    stop = asyncio.Event()
+    state = {"reason": "max_attempts" if timed else "requests"}
+    loop = asyncio.get_running_loop()
+
+    def interrupt() -> None:
+        state["reason"] = "interrupted"
+        stop.set()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        with contextlib.suppress(NotImplementedError, RuntimeError):
+            loop.add_signal_handler(sig, interrupt)
 
     async with httpx.AsyncClient(base_url=args.url, limits=limits, timeout=timeout) as client:
         t_start = time.perf_counter()
+        t_unix0 = time.time()
+        end_at = t_start + args.duration if timed else None
+
+        def more() -> bool:
+            if stop.is_set():
+                return False
+            if end_at is not None and time.perf_counter() >= end_at:
+                if state["reason"] != "interrupted":
+                    state["reason"] = "duration"
+                return False
+            return counter["next"] < total
 
         async def worker(wid: int) -> None:
-            while True:
+            while more():
                 i = counter["next"]
-                if i >= total:
-                    return
                 counter["next"] = i + 1
                 body, ctype = bodies[i % len(bodies)]
                 row: dict[str, Any] = {
@@ -129,6 +190,7 @@ async def run(
                 }
                 t0 = time.perf_counter()
                 row["t_start_s"] = t0 - t_start
+                row["t_unix"] = t_unix0 + (t0 - t_start)
                 try:
                     resp = await client.post(
                         "/v1/detect",
@@ -146,6 +208,7 @@ async def run(
                             doc = json.loads(payload)
                             row["boxes"] = len(doc["boxes"])
                             row["timing_ms"] = doc["timing_ms"]
+                            row["output_sha256"] = canonical_output(doc)
                         except (ValueError, KeyError, TypeError):
                             row["error"] = "MalformedResponse"  # a 200 without a valid body fails
                     else:
@@ -161,10 +224,52 @@ async def run(
                 rows.append(row)
                 if args.honor_retry_after and row.get("retry_after"):
                     with contextlib.suppress(ValueError):
-                        await asyncio.sleep(min(float(row["retry_after"]), 10.0))
+                        wait = min(float(row["retry_after"]), 10.0)
+                        if end_at is not None:
+                            wait = min(wait, max(0.0, end_at - time.perf_counter()))
+                        with contextlib.suppress(asyncio.TimeoutError):
+                            await asyncio.wait_for(stop.wait(), timeout=wait)
 
-        await asyncio.gather(*(worker(w) for w in range(args.concurrency)))
-    return rows, time.perf_counter() - t_start
+        tasks = [asyncio.ensure_future(worker(w)) for w in range(args.concurrency)]
+        hard = (args.duration + args.timeout + 5) if timed else None
+        done, pending = await asyncio.wait(tasks, timeout=hard)
+        for t in pending:  # only if the server hangs past the client timeout
+            t.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        for t in done:
+            t.result()  # surface client bugs instead of hiding them
+        if pending:
+            state["reason"] = "hard_stop"
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        with contextlib.suppress(NotImplementedError, RuntimeError):
+            loop.remove_signal_handler(sig)
+    return rows, time.perf_counter() - t_start, state["reason"]
+
+
+def check_outputs(
+    rows: list[dict[str, Any]], reference: dict[str, Any] | None, hashes: list[str]
+) -> dict[str, Any]:
+    """Consistency of outputs per input within the run, and against the reference if given."""
+    per_input: dict[int, set[str]] = {}
+    for r in rows:
+        if "output_sha256" in r:
+            per_input.setdefault(r["input"], set()).add(r["output_sha256"])
+    out: dict[str, Any] = {
+        "checked": sum(1 for r in rows if "output_sha256" in r),
+        "inconsistent_inputs": sorted(k for k, v in per_input.items() if len(v) > 1),
+    }
+    if reference is not None:
+        if reference.get("body_sha256") != hashes:
+            out["reference_error"] = "reference was recorded for different inputs"
+            out["mismatches"] = None
+        else:
+            expected = reference["outputs"]
+            out["mismatches"] = sum(
+                1
+                for r in rows
+                if "output_sha256" in r and r["output_sha256"] != expected[r["input"]]
+            )
+    return out
 
 
 def stats(values: list[float], rng: np.random.Generator) -> dict[str, Any]:
@@ -220,7 +325,21 @@ def summarize(
         )
         statuses[key] = statuses.get(key, 0) + 1
     stages = sorted({k for r in ok for k in r.get("server", {})})
+    rejected = [r for r in measured if outcome(r) == "rejected"]
+    completed = [r for r in measured if r["status"] != 0]
     return {
+        "mode": "duration" if getattr(args, "duration", None) is not None else "requests",
+        "stop_reason": getattr(args, "stop_reason", "requests"),
+        "attempts_total": len(rows),
+        "accounting": {
+            "attempts": len(measured),
+            "completed": len(completed),
+            "rejected": len(rejected),
+            "accepted": len(completed) - len(rejected),
+            "success": len(ok),
+        },
+        "attempt_rate_rps": len(measured) / window if window > 0 else 0.0,
+        "latency_rejected_ms": stats([r["latency_ms"] for r in rejected], rng),
         "label": args.label,
         "url": args.url,
         "concurrency": args.concurrency,
@@ -267,18 +386,54 @@ def main() -> int:
     p.add_argument("--bevdet-root")
     p.add_argument("--out", required=True)
     p.add_argument("--label", required=True)
+    p.add_argument(
+        "--duration", type=float, help="time-bounded mode: seconds (needs --max-attempts)"
+    )
+    p.add_argument(
+        "--max-attempts", type=int, help="time-bounded mode: cap on attempts incl. warm-up"
+    )
+    p.add_argument("--write-reference", help="store the output hash of every input (one each)")
+    p.add_argument("--reference", help="compare every 200 response with this reference")
     args = p.parse_args()
     if args.concurrency < 1 or args.requests < 1:
         raise SystemExit("concurrency and requests must be >= 1")
+    if (args.duration is None) != (args.max_attempts is None):
+        raise SystemExit("--duration and --max-attempts go together (both limits are required)")
+    if args.duration is not None and (args.duration <= 0 or args.max_attempts < 1):
+        raise SystemExit("--duration must be > 0 and --max-attempts >= 1")
     bodies, inputs = load_inputs(args.inputs, args.bevdet_root)
     inputs["mean_request_bytes"] = float(np.mean([len(b) for b, _ in bodies]))
-    rows, _ = asyncio.run(run(args, bodies))
+    hashes = body_hashes(bodies)
+    reference = json.loads(Path(args.reference).read_text()) if args.reference else None
+    cpu0, wall0 = resource.getrusage(resource.RUSAGE_SELF), time.perf_counter()
+    rows, _, args.stop_reason = asyncio.run(run(args, bodies))
+    cpu1, wall = resource.getrusage(resource.RUSAGE_SELF), time.perf_counter() - wall0
+    client_cpu = (cpu1.ru_utime - cpu0.ru_utime) + (cpu1.ru_stime - cpu0.ru_stime)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     (out / f"{args.label}.requests.jsonl").write_text(
         "\n".join(json.dumps(r) for r in sorted(rows, key=lambda r: r["i"])) + "\n"
     )
     summary = summarize(rows, args, inputs)
+    summary["outputs"] = check_outputs(rows, reference, hashes)
+    # the client is one asyncio thread: ~100% here means the load generator itself was saturated
+    summary["client_process"] = {
+        "cpu_s": round(client_cpu, 3),
+        "wall_s": round(wall, 3),
+        "cpu_pct": round(100 * client_cpu / wall, 1) if wall > 0 else None,
+    }
+    if args.write_reference:
+        per: dict[int, set[str]] = {}
+        for r in rows:
+            if "output_sha256" in r:
+                per.setdefault(r["input"], set()).add(r["output_sha256"])
+        if sorted(per) != list(range(len(bodies))) or any(len(v) != 1 for v in per.values()):
+            summary["outputs"]["reference_error"] = "every input needs exactly one output hash"
+        else:
+            Path(args.write_reference).write_text(json.dumps({
+                "inputs": args.inputs, "body_sha256": hashes,
+                "outputs": [next(iter(per[k])) for k in range(len(bodies))],
+            }, indent=2))  # fmt: skip
     (out / f"{args.label}.summary.json").write_text(json.dumps(summary, indent=2))
     lat = summary["latency_ms"]
     print(
@@ -296,7 +451,7 @@ def main() -> int:
             }
         )
     )
-    return 0
+    return 3 if args.stop_reason in ("interrupted", "hard_stop") else 0
 
 
 if __name__ == "__main__":
