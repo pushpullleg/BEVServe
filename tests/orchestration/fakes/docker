@@ -2,6 +2,7 @@
 # Fake `docker` for orchestration tests of tools/m5_bench.sh: no Docker daemon, no GPU.
 # "compose up" starts a local FakeDetector bevserve from the env file; state lives in $FAKE_STATE.
 # FAKE_DOWN_FAIL=1 makes `compose down` fail and leave the service running (cleanup-failure test).
+# FAKE_ENV_THREADS=N makes `inspect` report BEVSERVE_PREPROCESS_THREADS=N whatever was configured.
 set -u
 echo "docker $*" >> "$FAKE_STATE/calls.log"
 IMAGE_ID=sha256:$(printf 'f%.0s' {1..64})
@@ -13,13 +14,23 @@ case "$1" in
       *"{{json .}}"*) echo "{\"Id\": \"$IMAGE_ID\", \"Created\": \"now\", \"Size\": 1, \"RepoTags\": [\"fake:tag\"], \"Config\": {\"Labels\": {}}}" ;;
     esac ;;
   run) exec "$FAKE_PY" - package ;;   # docker run --rm -i ... python - package < provenance.py
-  inspect) cat "$FAKE_STATE/pid" ;;  # -f {{.State.Pid}}
+  inspect)
+    case "$*" in
+      *"{{.State.Pid}}"*) cat "$FAKE_STATE/pid" ;;
+      *"{{.Id}}"*) echo "container$(cat "$FAKE_STATE/pid")" ;;   # a new id per `compose up`
+      *".Config.Env"*)   # the environment compose gives the container (compose.yaml defaults to 0)
+        grep '^BEVSERVE_' "$FAKE_STATE/env" | grep -v '^BEVSERVE_PREPROCESS_THREADS='
+        echo "BEVSERVE_PREPROCESS_THREADS=${FAKE_ENV_THREADS:-$(sed -n 's/^BEVSERVE_PREPROCESS_THREADS=//p' "$FAKE_STATE/env" | tail -1)}"
+        ;;
+    esac ;;
   ps) if running && [[ "$*" == *"com.docker.compose.project="* ]]; then echo fakecontainer; fi ;;
   network) if running; then echo fakenetwork; fi ;;
   compose)
     case " $* " in
       *" up "*)
         envf=$(sed -E 's/.*--env-file ([^ ]+).*/\1/' <<< "$*")
+        cp "$envf" "$FAKE_STATE/env"
+        grep -q '^BEVSERVE_PREPROCESS_THREADS=' "$FAKE_STATE/env" || echo "BEVSERVE_PREPROCESS_THREADS=0" >> "$FAKE_STATE/env"
         set -a; . "$envf"; set +a
         BEVSERVE_PORT=$BEVSERVE_HOST_PORT setsid "$FAKE_PY" -c \
           "import sys; from bevserve.cli import main; sys.exit(main())" \

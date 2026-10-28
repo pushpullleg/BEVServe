@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# M5 performance characterization of the Stage-A-verified BEVServe GPU image. Operator-run.
+# M5/M6 performance characterization of a verified BEVServe GPU image. Operator-run.
 #
 #   MODE=pilot|full IMAGE=bevserve:<tag> EXPECT_IMAGE_ID=sha256:<id> \
 #   STAGE_A_DIR=outputs/m4-<run> FAULT_RETEST_DIR=outputs/m5-fault-<run> \
@@ -17,6 +17,14 @@
 #              Retry-After, ADMISSION_REQUESTS each; then readiness and 5 recovery requests; sampling
 #   soak       C = 2, SOAK_REQUESTS (100 = pilot soak; > 100 needs SOAK_FULL=1, max 1000); sampling,
 #              then /readyz and the 10-frame golden parity comparison
+#   ab         (M6) AB_TRIALS fresh services in ABBA order, A = BEVSERVE_PREPROCESS_THREADS=0,
+#              B = AB_THREADS; identical settings otherwise (server timing AB_SERVER_TIMING,
+#              max_in_flight AB_MAX_IN_FLIGHT). Per trial: C = 1 (AB_C1_REQUESTS) and C = 8
+#              (AB_C8_REQUESTS), each after AB_WARMUP warm-up, then the 10-frame golden parity;
+#              one 0.5 s resource sampler per trial; analysis tools/bench/ab.py. MODE=full needs
+#              PILOT_DIR = a passing MODE=pilot ab run on the same image and AB_THREADS.
+#              Without FAULT_RETEST_DIR (M6 images) the verification run must be all PASS and
+#              include the parallel golden and container-recreation checks for AB_THREADS.
 #
 #                   pilot  full (default)  allowed
 #   COLD_RUNS       1      3               1-5
@@ -24,6 +32,9 @@
 #   OVERHEAD_TRIALS 4      12              multiple of 4, 4-16; OVERHEAD_REQUESTS 20 / 100 (1-500)
 #   ADMISSION_LEVELS "8"   "8 16"          8 and/or 16; ADMISSION_REQUESTS 40 / 200 (1-500)
 #   SOAK_REQUESTS   20     100             pilot <= 50; full <= 100 unless SOAK_FULL=1 (<= 1000)
+#   AB_TRIALS       4      12              multiple of 4, 4-16; AB_THREADS 12 (1-32)
+#   AB_C1_REQUESTS  20     100             1-500 (pilot <= 50); AB_C8_REQUESTS 40 / 200 (1-500)
+#   AB_WARMUP       5      20              0-100; AB_MAX_IN_FLIGHT 16 (8-32)
 #
 # Safety: requires the Stage A image id (EXPECT_IMAGE_ID, checked against the Stage A record and the
 # passing fault retest) and an image whose bevserve package equals this work tree. One Compose
@@ -44,6 +55,10 @@ MODE=${MODE:-}
 STAGES=${STAGES:-cold levels overhead admission soak}
 INPUTS=${INPUTS:-nuscenes:even:20}
 NVIDIA_SMI=${NVIDIA_SMI:-nvidia-smi}
+# Golden comparison tool. Overriding it is for the fake-Docker tests only: it needs
+# BENCH_TEST_MODE=1, is recorded in meta.json, and a test-mode pilot never authorizes a full run.
+GOLDEN_TOOL=${GOLDEN_TOOL:-$REPO/tools/golden_http.py}
+TEST_MODE=${BENCH_TEST_MODE:-0}
 export NVIDIA_SMI
 read -r -a DOCKER <<< "${DOCKER_CMD:-sudo docker}"
 d() { "${DOCKER[@]}" "$@"; }
@@ -87,8 +102,10 @@ trap 'exec 1>&3 2>&4; log "interrupted"; exit 130' INT TERM
 
 # ------------------------------------------------------------------- parameters and bounds
 case "$MODE" in
-  pilot) P_COLD=1 P_LR=20 P_LW=5 P_OT=4 P_OR=20 P_OW=5 P_AL="8" P_AR=40 P_SR=20 P_SW=5 CAP=50 ;;
-  full)  P_COLD=3 P_LR=300 P_LW=20 P_OT=12 P_OR=100 P_OW=20 P_AL="8 16" P_AR=200 P_SR=100 P_SW=20 CAP=1000 ;;
+  pilot) P_COLD=1 P_LR=20 P_LW=5 P_OT=4 P_OR=20 P_OW=5 P_AL="8" P_AR=40 P_SR=20 P_SW=5 CAP=50
+         P_ABT=4 P_AB1=20 P_AB8=40 P_ABW=5 ;;
+  full)  P_COLD=3 P_LR=300 P_LW=20 P_OT=12 P_OR=100 P_OW=20 P_AL="8 16" P_AR=200 P_SR=100 P_SW=20 CAP=1000
+         P_ABT=12 P_AB1=100 P_AB8=200 P_ABW=20 ;;
   *) die "MODE must be pilot or full" ;;
 esac
 COLD_RUNS=${COLD_RUNS:-$P_COLD}
@@ -102,6 +119,13 @@ ADMISSION_LEVELS=${ADMISSION_LEVELS:-$P_AL}
 ADMISSION_REQUESTS=${ADMISSION_REQUESTS:-$P_AR}
 SOAK_REQUESTS=${SOAK_REQUESTS:-$P_SR}
 SOAK_WARMUP=${SOAK_WARMUP:-$P_SW}
+AB_TRIALS=${AB_TRIALS:-$P_ABT}
+AB_THREADS=${AB_THREADS:-12}
+AB_C1_REQUESTS=${AB_C1_REQUESTS:-$P_AB1}
+AB_C8_REQUESTS=${AB_C8_REQUESTS:-$P_AB8}
+AB_WARMUP=${AB_WARMUP:-$P_ABW}
+AB_MAX_IN_FLIGHT=${AB_MAX_IN_FLIGHT:-16}
+AB_SERVER_TIMING=${AB_SERVER_TIMING:-true}
 bounded() {  # bounded NAME MIN MAX: integer within [MIN, MAX] or abort
   local v=${!1}
   [[ "$v" =~ ^[0-9]+$ ]] && (( 10#$v >= $2 && 10#$v <= $3 )) || die "$1=$v must be an integer in [$2, $3]"
@@ -117,6 +141,14 @@ bounded OVERHEAD_REQUESTS 1 "$SMALL_CAP"
 bounded OVERHEAD_WARMUP 0 100
 bounded ADMISSION_REQUESTS 1 "$SMALL_CAP"
 bounded SOAK_WARMUP 0 100
+bounded AB_TRIALS 4 16
+(( AB_TRIALS % 4 == 0 )) || die "AB_TRIALS must be a multiple of 4 (whole ABBA blocks)"
+bounded AB_THREADS 1 32
+bounded AB_C1_REQUESTS 1 "$SMALL_CAP"
+bounded AB_C8_REQUESTS 1 "$SMALL_CAP"
+bounded AB_WARMUP 0 100
+bounded AB_MAX_IN_FLIGHT 8 32
+case "$AB_SERVER_TIMING" in true|false) ;; *) die "AB_SERVER_TIMING must be true or false" ;; esac
 [ -n "$ADMISSION_LEVELS" ] || die "ADMISSION_LEVELS is empty"
 for c in $ADMISSION_LEVELS; do case "$c" in 8|16) ;; *) die "ADMISSION_LEVELS may contain only 8 and 16" ;; esac; done
 bounded SOAK_REQUESTS 1 "$CAP"
@@ -124,17 +156,29 @@ if (( SOAK_REQUESTS > 100 )) && [ "${SOAK_FULL:-0}" != 1 ]; then
   die "SOAK_REQUESTS=$SOAK_REQUESTS needs SOAK_FULL=1 (separate authorization for the full soak)"
 fi
 for stage in $STAGES; do
-  case "$stage" in cold|levels|overhead|admission|soak) ;; *) die "unknown stage $stage" ;; esac
+  case "$stage" in cold|levels|overhead|admission|soak|ab) ;; *) die "unknown stage $stage" ;; esac
 done
+if [ "$GOLDEN_TOOL" != "$REPO/tools/golden_http.py" ]; then
+  [ "$TEST_MODE" = 1 ] || die "GOLDEN_TOOL may only be overridden with BENCH_TEST_MODE=1 (tests)"
+  log "WARNING: TEST MODE - golden comparison by $GOLDEN_TOOL; results are not benchmark evidence"
+fi
 
 # ------------------------------------------------------------------- inputs and prerequisites
-for var in IMAGE EXPECT_IMAGE_ID STAGE_A_DIR FAULT_RETEST_DIR BEVDET_ROOT CKPT_DIR CKPT_SHA256 GOLDEN_DIR HOST_PY; do
+for var in IMAGE EXPECT_IMAGE_ID STAGE_A_DIR BEVDET_ROOT CKPT_DIR CKPT_SHA256 GOLDEN_DIR HOST_PY; do
   [ -n "${!var:-}" ] || die "$var is not set"
 done
-for var in STAGE_A_DIR FAULT_RETEST_DIR BEVDET_ROOT CKPT_DIR GOLDEN_DIR; do
+FAULT_RETEST_DIR=${FAULT_RETEST_DIR:-}
+DIRS=(STAGE_A_DIR BEVDET_ROOT CKPT_DIR GOLDEN_DIR)
+[ -n "$FAULT_RETEST_DIR" ] && DIRS+=(FAULT_RETEST_DIR)
+for var in "${DIRS[@]}"; do
   abs=$(cd "${!var}" 2>/dev/null && pwd) || die "$var is not a directory"
   printf -v "$var" '%s' "$abs"
 done
+AB=0; [[ " $STAGES " == *" ab "* ]] && AB=1
+if [ "$AB" = 1 ] && [ "$MODE" = full ]; then
+  [ -n "${PILOT_DIR:-}" ] || die "MODE=full with stage ab needs PILOT_DIR (a passing MODE=pilot ab run)"
+  PILOT_DIR=$(cd "$PILOT_DIR" 2>/dev/null && pwd) || die "PILOT_DIR is not a directory"
+fi
 case "$HOST_PY" in /*) ;; *) HOST_PY=$(realpath -s "$HOST_PY") ;; esac
 CKPT_ACTUAL=$(sha256sum "$CKPT_DIR/$CKPT_FILE" | cut -d' ' -f1)
 [ "$CKPT_ACTUAL" = "$CKPT_SHA256" ] || die "checkpoint sha256 mismatch"
@@ -146,9 +190,18 @@ if [[ "${DOCKER[0]}" == sudo ]]; then
   ( while sleep 60; do sudo -n -v 2>/dev/null || exit; done ) & SUDO_KEEPALIVE=$!
 fi
 IMAGE_ID=$(d image inspect -f '{{.Id}}' "$IMAGE" 2>> "$LOG") || die "image $IMAGE not found"
-python3 "$REPO/tools/bench/verified_image.py" --expect "$EXPECT_IMAGE_ID" --actual "$IMAGE_ID" \
-  --stage-a "$STAGE_A_DIR" --retest "$FAULT_RETEST_DIR" > "$OUT/verified-image.json" \
-  || die "image is not the Stage-A-verified image (verified-image.json)"
+GATE=(--expect "$EXPECT_IMAGE_ID" --actual "$IMAGE_ID" --stage-a "$STAGE_A_DIR")
+if [ -n "$FAULT_RETEST_DIR" ]; then GATE+=(--retest "$FAULT_RETEST_DIR"); fi
+if [ "$AB" = 1 ]; then
+  GATE+=(--require "http-golden-parity with preprocess threads $AB_THREADS ("
+         --require "recreated container (new id) runs with BEVSERVE_PREPROCESS_THREADS=$AB_THREADS")
+fi
+python3 "$REPO/tools/bench/verified_image.py" "${GATE[@]}" > "$OUT/verified-image.json" \
+  || die "image is not the verified image (verified-image.json)"
+if [ "$AB" = 1 ] && [ "$MODE" = full ]; then
+  python3 "$REPO/tools/bench/ab.py" pilot-gate --pilot "$PILOT_DIR" --image-id "$IMAGE_ID" \
+    --threads "$AB_THREADS" > "$OUT/pilot-gate.json" || die "pilot did not pass (pilot-gate.json)"
+fi
 d image inspect -f '{{json .}}' "$IMAGE" 2>> "$LOG" | python3 -c "
 import json, sys
 i = json.load(sys.stdin)
@@ -187,6 +240,8 @@ meta = {
   "checkpoint": {"file": "$CKPT_FILE", "sha256": "$CKPT_ACTUAL",
                  "size_bytes": os.path.getsize("$CKPT_DIR/$CKPT_FILE")},
   "golden_sha256": sha("$GOLDEN_DIR/http_golden.json"),
+  "golden_tool": {"path": os.path.relpath("$GOLDEN_TOOL", "$REPO"), "sha256": sha("$GOLDEN_TOOL")},
+  "test_mode": "$TEST_MODE" == "1",
   "gpu": sh("$NVIDIA_SMI", "--query-gpu=name,driver_version,memory.total", "--format=csv,noheader"),
   "kernel": platform.release(), "host_cpu": cpu, "host_cpus": os.cpu_count(), "host_mem_gib": mem_gib,
   "inputs": "$INPUTS", "production_max_in_flight": 5, "deadline_s": 10,
@@ -199,6 +254,10 @@ meta = {
     "admission_levels": [int(c) for c in "$ADMISSION_LEVELS".split()],
     "admission_requests": $ADMISSION_REQUESTS, "soak_requests": $SOAK_REQUESTS,
     "soak_warmup": $SOAK_WARMUP, "soak_full": "${SOAK_FULL:-0}" == "1",
+    "ab_trials": $AB_TRIALS, "ab_threads": $AB_THREADS, "ab_c1_requests": $AB_C1_REQUESTS,
+    "ab_c8_requests": $AB_C8_REQUESTS, "ab_warmup": $AB_WARMUP,
+    "ab_max_in_flight": $AB_MAX_IN_FLIGHT, "ab_server_timing": "$AB_SERVER_TIMING" == "true",
+    "pilot_dir": "${PILOT_DIR:+$(basename "${PILOT_DIR:-}")}",
   },
 }
 json.dump(meta, open(os.path.join(out, "meta.json"), "w"), indent=2)
@@ -206,7 +265,9 @@ PY
 log "run $RUN_ID ($MODE): image $IMAGE ($IMAGE_ID), source $GIT_DESCRIBE, stages: $STAGES"
 
 # ------------------------------------------------------------------- helpers
-service_up() {  # service_up <stage> <server_timing true|false> <max_in_flight>
+LAST_CID=
+service_up() {  # service_up <stage> <server_timing true|false> <max_in_flight> [preprocess threads]
+  local threads=${4:-0}
   cat > "$ENVF" <<EOF
 BEVSERVE_IMAGE=$IMAGE
 BEVSERVE_CHECKPOINT_DIR=$CKPT_DIR
@@ -216,6 +277,7 @@ BEVSERVE_HOST_PORT=$PORT
 BEVSERVE_GPU=$GPU
 BEVSERVE_SERVER_TIMING=$2
 BEVSERVE_MAX_IN_FLIGHT=$3
+BEVSERVE_PREPROCESS_THREADS=$threads
 BEVSERVE_GIT_COMMIT=$GIT_DESCRIBE
 EOF
   UP=1   # from here on cleanup must remove the project, even if `up` fails half-way
@@ -229,10 +291,14 @@ EOF
   done
   [ "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/readyz")" = 200 ] || die "service not ready"
   READY_S=$(python3 -c "import time; print(round(time.time() - $T_UP, 2))")
-  CID=$(d "${DC[@]}" ps -q bevserve) && [ -n "$CID" ] || die "service container id"
+  CID=$(d "${DC[@]}" ps -q bevserve) && [ -n "$CID" ] && CID=$(d inspect -f '{{.Id}}' "$CID") || die "service container id"
+  [ "$CID" != "$LAST_CID" ] || die "service container was not recreated (same id as the previous service)"
+  LAST_CID=$CID
+  ENV_THREADS=$(d inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$CID" | sed -n 's/^BEVSERVE_PREPROCESS_THREADS=//p')
+  [ "$ENV_THREADS" = "$threads" ] || die "container runs with BEVSERVE_PREPROCESS_THREADS=${ENV_THREADS:-unset}, expected $threads"
   SERVER_PID=$(d inspect -f '{{.State.Pid}}' "$CID") && [[ "$SERVER_PID" =~ ^[1-9][0-9]*$ ]] || die "server pid"
-  record "{\"kind\": \"service\", \"seq\": $SERVICE_SEQ, \"stage\": \"$1\", \"server_timing\": $2, \"max_in_flight\": $3, \"ready_s\": $READY_S, \"container\": \"$CID\", \"host_pid\": $SERVER_PID}"
-  log "service $SERVICE_SEQ up ($1: timing=$2, max_in_flight=$3) ready in ${READY_S} s, host pid $SERVER_PID"
+  record "{\"kind\": \"service\", \"seq\": $SERVICE_SEQ, \"stage\": \"$1\", \"server_timing\": $2, \"max_in_flight\": $3, \"preprocess_threads\": $threads, \"preprocess_threads_env\": $ENV_THREADS, \"ready_s\": $READY_S, \"container\": \"$CID\", \"host_pid\": $SERVER_PID}"
+  log "service $SERVICE_SEQ up ($1: timing=$2, max_in_flight=$3, preprocess_threads=$threads) ready in ${READY_S} s, host pid $SERVER_PID"
 }
 service_down() {  # removes this run's project; UP stays 1 unless the removal is verified
   [ "$UP" = 1 ] || return 0
@@ -252,10 +318,10 @@ service_down() {  # removes this run's project; UP stays 1 unless the removal is
   record "{\"kind\": \"cleanup\", \"seq\": $SERVICE_SEQ, \"ok\": false, \"detail\": \"down exit $rc; containers: ${left:-none}; networks: ${nets:-none}\"}"
   return 1
 }
-start_sampler() {  # start_sampler <label>
+start_sampler() {  # start_sampler <label> [interval s]
   SAMPLER_LABEL=$1 SAMPLER_T0=$(date +%s.%N)
   "$HOST_PY" "$REPO/tools/bench/sampler.py" --pid "$SERVER_PID" --out "$OUT/$1.samples.csv" \
-    --meta "$OUT/$1.sampler.json" --interval 1 2>> "$LOG" &
+    --meta "$OUT/$1.sampler.json" --interval "${2:-1}" 2>> "$LOG" &
   SAMPLER=$!
 }
 stop_sampler() {  # a sampler that died early or exits non-zero yields an invalid record
@@ -323,13 +389,35 @@ for stage in $STAGES; do
     stop_sampler
     readyz_to "$OUT/soak-readyz.json"
     rc=0
-    ( cd "$BEVDET_ROOT" && PYTHONDONTWRITEBYTECODE=1 "$HOST_PY" "$REPO/tools/golden_http.py" compare \
+    ( cd "$BEVDET_ROOT" && PYTHONDONTWRITEBYTECODE=1 "$HOST_PY" "$GOLDEN_TOOL" compare \
         --url "http://127.0.0.1:$PORT" --golden "$GOLDEN_DIR/http_golden.json" ) \
       > "$OUT/soak-golden_compare.json" 2> "$OUT/soak-golden_compare.stderr" || rc=$?
     "$HOST_PY" "$REPO/tools/bench/validate.py" golden --label soak-golden --exit "$rc" \
       --file "$OUT/soak-golden_compare.json" --golden "$GOLDEN_DIR/http_golden.json" >> "$RUNS" 2>> "$LOG" \
       || { log "golden parity after soak: not executed or not passed (runs.jsonl)"; FAILED=1; }
     service_down || die "cleanup failed" ;;
+  ab)
+    k=0
+    for timing in $(python3 "$REPO/tools/bench/overhead.py" order "$AB_TRIALS"); do
+      k=$((k + 1))
+      if [ "$timing" = true ]; then arm=b threads=$AB_THREADS; else arm=a threads=0; fi
+      service_up ab "$AB_SERVER_TIMING" "$AB_MAX_IN_FLIGHT" "$threads"
+      start_sampler "ab-t$k" 0.5
+      p10=$(date +%s.%N); bench "ab-t$k-$arm-c1" 1 "$AB_C1_REQUESTS" "$AB_WARMUP"; p11=$(date +%s.%N)
+      p80=$(date +%s.%N); bench "ab-t$k-$arm-c8" 8 "$AB_C8_REQUESTS" "$AB_WARMUP"; p81=$(date +%s.%N)
+      record "{\"kind\": \"phase\", \"label\": \"ab-t$k\", \"arm\": \"$arm\", \"c1\": [$p10, $p11], \"c8\": [$p80, $p81]}"
+      rc=0
+      ( cd "$BEVDET_ROOT" && PYTHONDONTWRITEBYTECODE=1 "$HOST_PY" "$GOLDEN_TOOL" compare \
+          --url "http://127.0.0.1:$PORT" --golden "$GOLDEN_DIR/http_golden.json" ) \
+        > "$OUT/ab-t$k-golden_compare.json" 2> "$OUT/ab-t$k-golden_compare.stderr" || rc=$?
+      stop_sampler
+      "$HOST_PY" "$REPO/tools/bench/validate.py" golden --label "ab-t$k-golden" --exit "$rc" \
+        --file "$OUT/ab-t$k-golden_compare.json" --golden "$GOLDEN_DIR/http_golden.json" >> "$RUNS" 2>> "$LOG" \
+        || { log "golden parity in trial $k ($arm): not executed or not passed (runs.jsonl)"; FAILED=1; }
+      service_down || die "cleanup failed"
+    done
+    "$HOST_PY" "$REPO/tools/bench/ab.py" analyze --dir "$OUT" --trials "$AB_TRIALS" > "$OUT/ab.json" \
+      || { log "ab analysis failed"; FAILED=1; } ;;
   esac
 done
 

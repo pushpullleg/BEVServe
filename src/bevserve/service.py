@@ -17,6 +17,7 @@ from typing import Literal
 
 import anyio
 
+from bevserve.camera_pool import CameraPool
 from bevserve.detector import Detector, DetectorFactory, DetectorInitError, FatalDetectorError
 from bevserve.executor import InferenceExecutor
 from bevserve.schemas import Readiness
@@ -42,6 +43,10 @@ class Service:
         self.executor: InferenceExecutor | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._exit_scheduled = False
+        # Parallel preprocessing pool (None = serial path); threads start on first use.
+        self.camera_pool: CameraPool | None = (
+            CameraPool(settings.preprocess_threads) if settings.preprocess_threads > 0 else None
+        )
 
     @property
     def status(self) -> Status:
@@ -98,3 +103,5 @@ class Service:
     def shutdown(self) -> None:
         if self.executor is not None:
             self.executor.shutdown()
+        if self.camera_pool is not None:
+            self.camera_pool.shutdown()

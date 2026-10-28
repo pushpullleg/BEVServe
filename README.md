@@ -4,12 +4,13 @@ HTTP inference service for camera-only 3D object detection with
 [BEVDet](https://github.com/HuangJunJie2017/BEVDet): six camera images plus calibration in, 3D
 boxes out.
 
-> **Status: milestone M5.** The service serves the released BEVDet-R50 checkpoint on a local GPU
+> **Status: milestone M6.** The service serves the released BEVDet-R50 checkpoint on a local GPU
 > (`BEVSERVE_DETECTOR=bevdet`), or a **FakeDetector** with fixed synthetic boxes (default).
 > Verified locally: over all 6,019 nuScenes val frames BEVServe's input path and adapter reproduce
 > the reference evaluation (mAP 0.3086, NDS 0.3941, identical to every printed digit), and HTTP
 > responses on 200 frames are identical to BEVDet's own evaluation path. The GPU container (M4) was
-> benchmarked on one workstation (M5, below).
+> benchmarked on one workstation (M5), and an opt-in parallel preprocessing mode was verified and
+> benchmarked against it (M6, below).
 
 ## What M1 contains
 
@@ -110,6 +111,35 @@ in [docs/m5-report.md](docs/m5-report.md).
 - Not established: the overhead of the optional `Server-Timing` instrumentation (+1.1 ms measured,
   95% CI −8.1 to +10.4 ms, against a 3.1 ms limit).
 
+## Parallel preprocessing (M6)
+
+M5 showed that most of a request's time was spent decoding and resizing the six camera images one
+after another on the CPU. Setting `BEVSERVE_PREPROCESS_THREADS=12` processes the six cameras on a
+shared, bounded thread pool. It runs the same decode, resize, crop and normalize code, so model
+inputs are byte-identical to the serial path: verified on all 6,019 nuScenes val frames, and by
+golden output parity in every benchmark container. Full evidence:
+[docs/m6-report.md](docs/m6-report.md).
+
+Controlled A/B on the same image (`sha256:8d1a4454…80fb`; 12 fresh containers, ABBA order, 6
+pairs; ratio parallel / serial with 95% CI):
+
+| Metric | Serial | 12 threads | Ratio [95% CI] |
+| --- | --- | --- | --- |
+| p50 latency, concurrency 1 | 109.1 ms | 32.9 ms | 0.302 [0.298, 0.305] |
+| Throughput, concurrency 8 | 42.1 req/s | 49.5 req/s | 1.173 [1.159, 1.187] |
+| p95 latency, concurrency 8 | 194.1 ms | 164.6 ms | 0.849 [0.829, 0.869] |
+
+All 3,600 measured requests succeeded. Server CPU use fell 20% at concurrency 1 and 53% at
+concurrency 8, and peak memory did not increase. At concurrency 8 the single GPU slot is now the limit.
+
+The default stays `BEVSERVE_PREPROCESS_THREADS=0` (serial, as verified in M5), because admission
+at the production limit and the soak have not yet been re-run in parallel mode. To enable it, set
+the variable for the container, for example in the Compose env file:
+
+```bash
+BEVSERVE_PREPROCESS_THREADS=12   # 0 = serial (default); 1-32 = parallel; 12 is the benchmarked value
+```
+
 ## API summary
 
 Request parts: `CAM_FRONT_LEFT`, `CAM_FRONT`, `CAM_FRONT_RIGHT`, `CAM_BACK_LEFT`, `CAM_BACK`,
@@ -147,7 +177,9 @@ Environment variables `BEVSERVE_*` (see `src/bevserve/settings.py`): `HOST` (def
 `127.0.0.1`), `PORT`, `ALLOWED_BIND_HOSTS`, `MAX_REQUEST_BYTES` (50 MiB), `MAX_IMAGE_BYTES`
 (8 MiB), `MAX_CALIBRATION_BYTES` (64 KiB), `MAX_IN_FLIGHT` (5), `DEADLINE_S` (10),
 `STALL_AFTER_S` (30), `FATAL_EXIT_GRACE_S`, `FATAL_EXIT_CODE`, `SERVER_TIMING` (false; adds a
-`Server-Timing` response header for benchmarks, body unchanged).
+`Server-Timing` response header for benchmarks, body unchanged). `PREPROCESS_THREADS` (0 = serial decode and
+preprocessing, the default; 1–32 = the six cameras on a shared thread pool with byte-identical
+model inputs; 12 was verified and benchmarked in M6).
 
 ## Data and licensing
 

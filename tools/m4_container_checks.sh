@@ -116,6 +116,8 @@ for var in BEVDET_ROOT CKPT_DIR GOLDEN_DIR; do
   printf -v "$var" '%s' "$abs"
 done
 case "$HOST_PY" in /*) ;; *) HOST_PY=$(realpath -s "$HOST_PY") ;; esac   # keep env symlinks
+[[ "${PARALLEL_THREADS:-12}" =~ ^[0-9]+$ ]] && (( ${PARALLEL_THREADS:-12} >= 1 && ${PARALLEL_THREADS:-12} <= 32 )) \
+  || die "input: PARALLEL_THREADS must be an integer in [1, 32]"
 for tool in curl ss python3 sha256sum; do command -v "$tool" > /dev/null || die "input: $tool not found"; done
 [ -d "$BEVDET_ROOT/mmdet3d" ] || die "input: BEVDET_ROOT is not a BEVDet checkout"
 [ -r "$BEVDET_ROOT/data/nuscenes/bevdetv3-trainval_infos_val.pkl" ] || die "input: val info file missing"
@@ -229,6 +231,44 @@ log "== 4. real-frame parity vs M3 golden (host client; golden never enters a co
     --url "http://127.0.0.1:$PORT" --golden "$GOLDEN_DIR/http_golden.json" ) > "$OUT/golden_compare.json" 2> "$OUT/golden_compare.stderr"
 check "http-golden-parity (10 real frames, byte-identical boxes)" json_ok "d['pass']" "$OUT/golden_compare.json"
 
+# M6: the same golden comparison with the experimental parallel preprocessing enabled. The env
+# file gets the setting only for this step and is restored before the fault test.
+PARALLEL_THREADS=${PARALLEL_THREADS:-12}
+log "== 4b. real-frame parity with BEVSERVE_PREPROCESS_THREADS=$PARALLEL_THREADS"
+full_id() { local c; c=$(d "${DC[@]}" ps -q bevserve 2>> "$LOG") && [ -n "$c" ] && d inspect -f '{{.Id}}' "$c" 2>> "$LOG"; }
+threads_env() {  # the running container's own BEVSERVE_PREPROCESS_THREADS (Config.Env)
+  d inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$1" 2>> "$LOG" | sed -n 's/^BEVSERVE_PREPROCESS_THREADS=//p'
+}
+GOLDEN_FRAMES=$(python3 -c "import json,sys; print(len(json.load(open(sys.argv[1]))['frames']))" "$GOLDEN_DIR/http_golden.json")
+SERIAL_CID=$(full_id) || SERIAL_CID=
+SERIAL_THREADS=$( [ -n "$SERIAL_CID" ] && threads_env "$SERIAL_CID" )
+echo "serial container $SERIAL_CID: BEVSERVE_PREPROCESS_THREADS=${SERIAL_THREADS:-unset}" >> "$LOG"
+if [ -z "$SERIAL_CID" ] || [ "$SERIAL_THREADS" != 0 ]; then
+  fail "parallel: serial container not verified (id ${SERIAL_CID:-none}, threads ${SERIAL_THREADS:-unset}); parallel check not run"
+else
+  pass "parallel: serial container runs with BEVSERVE_PREPROCESS_THREADS=0"
+  cp "$ENVF" "$ENVF.serial"
+  echo "BEVSERVE_PREPROCESS_THREADS=$PARALLEL_THREADS" >> "$ENVF"
+  PAR_CID= PAR_THREADS=
+  if d "${DC[@]}" up -d --no-build >> "$LOG" 2>&1 && PAR_CID=$(full_id); then PAR_THREADS=$(threads_env "$PAR_CID"); fi
+  echo "parallel container ${PAR_CID:-none}: BEVSERVE_PREPROCESS_THREADS=${PAR_THREADS:-unset}" >> "$LOG"
+  if [ -z "$PAR_CID" ] || [ "$PAR_CID" = "$SERIAL_CID" ] || [ "$PAR_THREADS" != "$PARALLEL_THREADS" ]; then
+    fail "parallel: container not recreated with BEVSERVE_PREPROCESS_THREADS=$PARALLEL_THREADS (id ${PAR_CID:-none}, threads ${PAR_THREADS:-unset})"
+  elif ! wait_ready 240 > /dev/null; then
+    fail "parallel: service did not become ready"
+  else
+    pass "parallel: recreated container (new id) runs with BEVSERVE_PREPROCESS_THREADS=$PARALLEL_THREADS"
+    ( cd "$BEVDET_ROOT" && PYTHONDONTWRITEBYTECODE=1 "$HOST_PY" "$REPO/tools/golden_http.py" compare \
+        --url "http://127.0.0.1:$PORT" --golden "$GOLDEN_DIR/http_golden.json" ) \
+      > "$OUT/golden_compare_parallel.json" 2> "$OUT/golden_compare_parallel.stderr"
+    check "http-golden-parity with preprocess threads $PARALLEL_THREADS ($GOLDEN_FRAMES real frames, byte-identical boxes)" \
+      json_ok "d['pass'] and d['model_identity_ok'] and len(d['frames']) == int(sys.argv[2]) == 10 and all(f['status'] == 200 and f['boxes_identical'] and f['frame_units_ok'] and f['identity_ok'] for f in d['frames'])" \
+      "$OUT/golden_compare_parallel.json" "$GOLDEN_FRAMES"
+  fi
+  mv "$ENVF.serial" "$ENVF"   # always restored; later steps recreate from the serial env file
+  grep -q '^BEVSERVE_PREPROCESS_THREADS=' "$ENVF" && fail "parallel: serial env file not restored"
+fi
+
 # ------------------------------------------------------------------- 5. fatal exit and restart
 log "== 5. fatal runtime error -> exit 70 -> supervised restart -> ready"
 d "${DC[@]}" stop >> "$LOG" 2>&1
@@ -242,6 +282,8 @@ EOF
 DC=("${BASE_DC[@]}" -f "$OUT/compose.fault.yaml"); FDC=("${DC[@]}")
 d "${FDC[@]}" up -d --no-build >> "$LOG" 2>&1 || fail "fault: compose up"
 FID=$(d "${FDC[@]}" ps -q bevserve) && [ -n "$FID" ] && FID=$(d inspect -f '{{.Id}}' "$FID")   # full id (events)
+if [ -n "$FID" ] && [ "$(threads_env "$FID")" = 0 ]; then pass "fault: container runs with BEVSERVE_PREPROCESS_THREADS=0 (env restored)"
+else fail "fault: container not running with BEVSERVE_PREPROCESS_THREADS=0"; fi
 if [ -n "$FID" ] && wait_ready 240 > /dev/null; then
   T_START=$(date +%s.%N); RC0=$(d inspect -f '{{.RestartCount}}' "$FID")
   PYTHONPATH="$REPO" PYTHONDONTWRITEBYTECODE=1 "$HOST_PY" - "$PORT" > "$OUT/fault_requests.txt" 2>> "$LOG" <<'PY'

@@ -26,6 +26,10 @@ class Settings(BaseSettings):
     # Execution slot (review correction 1): jobs in flight = 1 running + queued.
     max_in_flight: int = Field(default=5, ge=1)
     deadline_s: float = Field(default=10.0, gt=0)
+
+    # Experimental (M6): 0 = serial decode + preprocessing (default, as in M5); N = the six
+    # cameras' decode + preprocessing on a shared pool of N threads (byte-identical inputs).
+    preprocess_threads: int = Field(default=0, ge=0, le=32)
     stall_after_s: float = Field(default=30.0, gt=0)
 
     # Fatal runtime failure (review correction 2): exit so the supervisor restarts the process.

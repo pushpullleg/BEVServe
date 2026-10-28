@@ -1,11 +1,14 @@
-"""Gate: the image to benchmark is the one verified in M5 Stage A (stdlib only).
+"""Gate: the image to benchmark is the one verified by the container checks (stdlib only).
 
-    python tools/bench/verified_image.py --expect ID --actual ID --stage-a DIR --retest DIR
+    python tools/bench/verified_image.py --expect ID --actual ID --stage-a DIR [--retest DIR] \
+        [--require TEXT ...]
 
-Stage A is tools/m4_container_checks.sh on the M5 image (DIR/image.txt, DIR/summary.txt). Its only
-accepted failure is the fault-check exit-code query that tools/m5_fault_retest.sh superseded; that
-retest must have passed every check on the same image id. Prints the evidence (with sha256 of both
-summaries) as JSON; exit status 1 unless every condition holds.
+The verification run is tools/m4_container_checks.sh on that image (DIR/image.txt,
+DIR/summary.txt). With --retest (M5): its only accepted failure is the fault-check exit-code query
+that tools/m5_fault_retest.sh superseded, and that retest must have passed every check on the same
+image id. Without --retest (M6 onwards): every line must be PASS. Each --require text must appear
+in a PASS line (for example the parallel-preprocessing golden check). Prints the evidence (with
+sha256 of the summaries) as JSON; exit status 1 unless every condition holds.
 """
 
 from __future__ import annotations
@@ -22,7 +25,13 @@ SUPERSEDED = "FAIL fault: process exited with code 70 (saw: )"  # stage A; repla
 RETEST_REQUIRED = ("process exited with code 70 (docker die event", "request after recovery -> 200")
 
 
-def gate(expect: str, actual: str, stage_a: Path, retest: Path) -> dict[str, Any]:
+def gate(
+    expect: str,
+    actual: str,
+    stage_a: Path,
+    retest: Path | None,
+    require: tuple[str, ...] = (),
+) -> dict[str, Any]:
     reasons: list[str] = []
     if not re.fullmatch(r"sha256:[0-9a-f]{64}", expect):
         reasons.append("EXPECT_IMAGE_ID is not a full sha256 image id")
@@ -31,14 +40,29 @@ def gate(expect: str, actual: str, stage_a: Path, retest: Path) -> dict[str, Any
     try:
         image_txt = (stage_a / "image.txt").read_text()
         a_lines = (stage_a / "summary.txt").read_text().splitlines()
-        r_lines = (retest / "summary.txt").read_text().splitlines()
+        r_lines = (retest / "summary.txt").read_text().splitlines() if retest else []
     except OSError as exc:
         return {"pass": False, "reasons": [*reasons, f"verification record missing: {exc}"]}
     if f"id={expect} " not in image_txt + " ":
         reasons.append("stage A verified a different image id")
     a_fail = [x for x in a_lines if not x.startswith("PASS ")]
-    if not a_lines or any(x != SUPERSEDED for x in a_fail):
-        reasons.append(f"stage A has unaccepted results: {[x for x in a_fail if x != SUPERSEDED]}")
+    accepted = {SUPERSEDED} if retest else set()
+    if not a_lines or any(x not in accepted for x in a_fail):
+        unaccepted = [x for x in a_fail if x not in accepted]
+        reasons.append(f"stage A has unaccepted results: {unaccepted}")
+    for needed in require:
+        if not any(x.startswith("PASS ") and needed in x for x in a_lines):
+            reasons.append(f"stage A lacks the passed check '{needed}'")
+    if retest is None:
+        return {
+            "pass": not reasons,
+            "reasons": reasons,
+            "image_id": actual,
+            "stage_a_dir": stage_a.name,
+            "stage_a_summary_sha256": hashlib.sha256("\n".join(a_lines).encode()).hexdigest(),
+            "stage_a_checks_passed": len(a_lines),
+            "required_checks": list(require),
+        }
     r_fail = [x for x in r_lines if not x.startswith("PASS ")]
     if not r_lines or r_fail:
         reasons.append(f"fault retest did not pass every check: {r_fail}")
@@ -64,9 +88,11 @@ def main() -> int:
     p.add_argument("--expect", required=True)
     p.add_argument("--actual", required=True)
     p.add_argument("--stage-a", required=True)
-    p.add_argument("--retest", required=True)
+    p.add_argument("--retest")
+    p.add_argument("--require", action="append", default=[])
     a = p.parse_args()
-    result = gate(a.expect, a.actual, Path(a.stage_a), Path(a.retest))
+    retest = Path(a.retest) if a.retest else None
+    result = gate(a.expect, a.actual, Path(a.stage_a), retest, tuple(a.require))
     print(json.dumps(result, indent=2))
     return 0 if result["pass"] else 1
 

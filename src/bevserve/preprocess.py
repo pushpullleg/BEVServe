@@ -15,7 +15,7 @@ Fidelity notes (each is tested):
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 import cv2
@@ -128,18 +128,27 @@ def bda_matrix() -> FloatArray:
     return np.eye(4, dtype=np.float32)
 
 
+def camera_plane(name: str, image: Image.Image) -> FloatArray:
+    """One camera: RGB 1600x900 image -> (3, 256, 704) float32 plane. Touches only its inputs."""
+    if image.size != (SRC_WIDTH, SRC_HEIGHT) or image.mode != "RGB":
+        raise ValueError(
+            f"{name}: expected RGB {SRC_WIDTH}x{SRC_HEIGHT}, got {image.mode} {image.size}"
+        )
+    return normalize(transform_image(image))
+
+
 def build_inputs(images: Mapping[str, Image.Image], rig: RigCalibration) -> ModelInputs:
-    """Six RGB 1600x900 images (by camera name) + calibration -> model inputs."""
+    """Six RGB 1600x900 images (by camera name) + calibration -> model inputs (serial path)."""
     if set(images) != set(CAMERA_ORDER):
         raise ValueError(f"images must be exactly {CAMERA_ORDER}")
-    planes = []
-    for name in CAMERA_ORDER:
-        image = images[name]
-        if image.size != (SRC_WIDTH, SRC_HEIGHT) or image.mode != "RGB":
-            raise ValueError(
-                f"{name}: expected RGB {SRC_WIDTH}x{SRC_HEIGHT}, got {image.mode} {image.size}"
-            )
-        planes.append(normalize(transform_image(image)))
+    planes = [camera_plane(name, images[name]) for name in CAMERA_ORDER]
+    return assemble_inputs(planes, rig)
+
+
+def assemble_inputs(planes: Sequence[FloatArray], rig: RigCalibration) -> ModelInputs:
+    """Camera planes in CAMERA_ORDER + calibration -> model inputs (shared by both paths)."""
+    if len(planes) != N_CAMS:
+        raise ValueError(f"expected {N_CAMS} camera planes, got {len(planes)}")
     sensor2egos, ego2globals, intrins = rig_matrices(rig)
     post_rot, post_tran = image_post_transform()
     inputs = ModelInputs(

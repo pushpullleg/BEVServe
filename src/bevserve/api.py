@@ -17,6 +17,7 @@ from starlette.datastructures import FormData, UploadFile
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from bevserve import __version__
+from bevserve.camera_pool import CameraDecodeError, CameraPool
 from bevserve.constants import CAMERA_ORDER, OUTPUT_FRAME, SRC_HEIGHT, SRC_WIDTH
 from bevserve.detector import Detection, DetectorError, DetectorFactory, FatalDetectorError
 from bevserve.errors import ApiError, install_error_handlers, request_id_of
@@ -227,6 +228,19 @@ def _decode_and_build(
     return inputs, (t1 - t0) * 1000, (time.perf_counter() - t1) * 1000
 
 
+def _decode_and_build_parallel(
+    pool: CameraPool, raw: dict[str, bytes], calibration: CalibrationRequest
+) -> tuple[ModelInputs, float, float]:
+    """BEVSERVE_PREPROCESS_THREADS > 0: same functions per camera on the pool, same errors."""
+    try:
+        return pool.build(raw, calibration.to_rig)
+    except CameraDecodeError as exc:
+        if isinstance(exc.error, ImageRejectedError):
+            err = exc.error
+            raise _field_error(422, err.code, exc.camera, f"{exc.camera}: {err.detail}") from err
+        raise exc.error from None
+
+
 def _boxes(
     detections: Sequence[Detection], options: DetectOptions, class_names: list[str]
 ) -> list[Box3D]:
@@ -288,9 +302,15 @@ async def _detect(request: Request, service: Service) -> JSONResponse:
             raise ApiError(503, "not_ready", "Service not ready", "status=fatal") from exc
 
         with admission:
-            inputs, decode_ms, preprocess_ms = await anyio.to_thread.run_sync(
-                _decode_and_build, raw, calibration
-            )
+            pool = service.camera_pool
+            if pool is None:
+                inputs, decode_ms, preprocess_ms = await anyio.to_thread.run_sync(
+                    _decode_and_build, raw, calibration
+                )
+            else:
+                inputs, decode_ms, preprocess_ms = await anyio.to_thread.run_sync(
+                    _decode_and_build_parallel, pool, raw, calibration
+                )
             t_inf = time.perf_counter()
             try:
                 job_timing: dict[str, float] | None = {} if settings.server_timing else None

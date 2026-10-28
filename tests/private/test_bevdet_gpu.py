@@ -120,3 +120,31 @@ def test_timing_instrumentation_does_not_change_outputs(detector: BEVDetDetector
         detector.timing_enabled = False
     for a, b in zip(plain, timed, strict=True):
         np.testing.assert_array_equal(a, b)
+
+
+def test_parallel_preprocessing_gives_identical_outputs(detector: BEVDetDetector) -> None:
+    """M6: model outputs from serial and pooled preprocessing are bit-identical."""
+    import numpy as np
+
+    from bevserve.api import _decode_and_build, _decode_and_build_parallel
+    from bevserve.camera_pool import CameraPool
+    from bevserve.constants import CAMERA_ORDER
+    from bevserve.schemas import CalibrationRequest
+    from tests.synthetic import calibration_payload, encode, synthetic_image
+
+    calibration = CalibrationRequest.model_validate(calibration_payload(with_ego_poses=True))
+    for size in (6, 12, 24):
+        pool = CameraPool(size)
+        try:
+            for seed in range(2):
+                raw = {
+                    n: encode(synthetic_image(10 * seed + i)) for i, n in enumerate(CAMERA_ORDER)
+                }
+                serial = detector.detect_native(_decode_and_build(raw, calibration)[0])
+                pooled = detector.detect_native(
+                    _decode_and_build_parallel(pool, raw, calibration)[0]
+                )
+                for a, b in zip(serial, pooled, strict=True):
+                    np.testing.assert_array_equal(a, b)
+        finally:
+            pool.shutdown()

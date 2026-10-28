@@ -34,26 +34,45 @@ SOAK_GPU_GROWTH_MIB = 100.0
 SOAK_P50_DRIFT_RATIO = 1.25
 LEVELS = (1, 2, 4, 8)
 SAMPLED_STAGES = ("levels", "admission", "soak")
+# M6 A/B (docs/m6-plan.md): ratios are B (parallel) / A (serial), 95% t interval over trial pairs.
+AB_C1_P50_MAX_UCB = 0.85
+AB_C8_RPS_MIN_LCB = 0.95
+AB_C8_P95_MAX_UCB = 1.10
+AB_MEMORY_MAX_UCB = 1.10
 
 
 def plan(p: dict[str, Any]) -> dict[str, list[tuple[str, int, int, int]]]:
     """stage -> [(label, requests, warmup, concurrency)], mirroring tools/m5_bench.sh."""
-    out: dict[str, list[tuple[str, int, int, int]]] = {
-        "cold": [(f"cold{k}-first", 1, 0, 1) for k in range(1, p["cold_runs"] + 1)],
-        "levels": [(f"levels-c{c}", p["level_requests"], p["level_warmup"], c) for c in LEVELS],
-        "overhead": [
+    stages: dict[str, Any] = {
+        "cold": lambda: [(f"cold{k}-first", 1, 0, 1) for k in range(1, p["cold_runs"] + 1)],
+        "levels": lambda: [
+            (f"levels-c{c}", p["level_requests"], p["level_warmup"], c) for c in LEVELS
+        ],
+        "overhead": lambda: [
             (f"overhead-t{k}-timing-{arm}", p["overhead_requests"], p["overhead_warmup"], 1)
             for k, arm in enumerate(overhead_order(p["overhead_trials"]), start=1)
         ],
-        "admission": [
-            (f"admission-c{c}-{m}", p["admission_requests"], 0, c)
-            for c in p["admission_levels"]
-            for m in ("noretry", "honor")
-        ]
-        + [("admission-recovery", 5, 0, 1)],
-        "soak": [(f"soak-{p['soak_requests']}", p["soak_requests"], p["soak_warmup"], 2)],
+        "admission": lambda: (
+            [
+                (f"admission-c{c}-{m}", p["admission_requests"], 0, c)
+                for c in p["admission_levels"]
+                for m in ("noretry", "honor")
+            ]
+            + [("admission-recovery", 5, 0, 1)]
+        ),
+        "soak": lambda: [(f"soak-{p['soak_requests']}", p["soak_requests"], p["soak_warmup"], 2)],
+        "ab": lambda: [
+            (f"ab-t{k}-{arm}-c{c}", p[f"ab_c{c}_requests"], p["ab_warmup"], c)
+            for k, arm in ab_trials(p["ab_trials"])
+            for c in (1, 8)
+        ],
     }
-    return {s: out[s] for s in p["stages"]}
+    return {s: stages[s]() for s in p["stages"]}
+
+
+def ab_trials(trials: int) -> list[tuple[int, str]]:
+    """[(trial, "a"|"b")] in ABBA execution order (A = serial, B = parallel)."""
+    return [(k, "b" if x == "true" else "a") for k, x in enumerate(overhead_order(trials), 1)]
 
 
 def overhead_order(trials: int) -> list[str]:
@@ -107,6 +126,7 @@ def evaluate(d: Path) -> dict[str, Any]:
     records: dict[tuple[str, str], dict[str, Any]] = {}
     cleanups: list[dict[str, Any]] = []
     services = 0
+    service_records: list[dict[str, Any]] = []
     runs_f = d / "runs.jsonl"
     for line in runs_f.read_text().splitlines() if runs_f.exists() else []:
         r = json.loads(line)
@@ -114,6 +134,7 @@ def evaluate(d: Path) -> dict[str, Any]:
             cleanups.append(r)
         elif r.get("kind") == "service":
             services += 1
+            service_records.append(r)
         else:
             records[(r["kind"], r["label"])] = r
     out: dict[str, Any] = {"mode": "pilot" if pilot else "full"}
@@ -149,6 +170,8 @@ def evaluate(d: Path) -> dict[str, Any]:
         },
     )
     sampled = [s for s in SAMPLED_STAGES if s in stages]
+    if "ab" in stages:
+        sampled += [f"ab-t{k}" for k, _ in ab_trials(params["ab_trials"])]
     bad_s = [s for s in sampled if records.get(("sampler", s), {}).get("valid") is not True]
     put(
         "execution: resource samplers ran throughout and attributed GPU memory to the server",
@@ -340,7 +363,109 @@ def evaluate(d: Path) -> dict[str, Any]:
         drift is not None and drift <= SOAK_P50_DRIFT_RATIO,
         drift_ratio=drift,
     )
+    if "ab" in stages:
+        evaluate_ab(d, params, records, service_records, summ, put, out)
     return out
+
+
+def evaluate_ab(
+    d: Path,
+    params: dict[str, Any],
+    records: dict[tuple[str, str], dict[str, Any]],
+    services: list[dict[str, Any]],
+    summ: Any,
+    put: Any,
+    out: dict[str, Any],
+) -> None:
+    trials = ab_trials(params["ab_trials"])
+    threads = params["ab_threads"]
+    ab_services = [r for r in services if r.get("stage") == "ab"]
+    expected = [threads if arm == "b" else 0 for _, arm in trials]
+    put(
+        "ab: every trial ran in a fresh container with the intended BEVSERVE_PREPROCESS_THREADS",
+        "correctness",
+        "ab",
+        len(ab_services) == len(trials)
+        and len({r.get("container") for r in ab_services}) == len(trials)
+        and [r.get("preprocess_threads_env") for r in ab_services] == expected,
+        containers=len({r.get("container") for r in ab_services}),
+        threads_env=[r.get("preprocess_threads_env") for r in ab_services],
+        expected=expected,
+    )
+    outcomes = {
+        f"ab-t{k}-{arm}-c{c}": (summ(f"ab-t{k}-{arm}-c{c}") or {}).get("outcomes", "invalid run")
+        for k, arm in trials
+        for c in (1, 8)
+    }
+    put(
+        "ab: every request at C = 1 and C = 8 succeeded in every trial",
+        "correctness",
+        "ab",
+        all(
+            isinstance(o, dict)
+            and set(o) == {"ok"}
+            and o["ok"] == params[f"ab_c{label[-1]}_requests"]
+            for label, o in outcomes.items()
+        ),
+        outcomes=outcomes,
+    )
+    golden = {f"ab-t{k}": records.get(("golden", f"ab-t{k}-golden"), {}) for k, _ in trials}
+    put(
+        "ab: golden parity (all frames byte-identical) in every trial container, both arms",
+        "correctness",
+        "ab",
+        all(g.get("valid") is True for g in golden.values()),
+        golden={k: {"valid": g.get("valid"), "problems": g.get("problems", ["no record"])}
+                for k, g in golden.items()},
+    )  # fmt: skip
+    ab = load_json(d / "ab.json")
+    est = (ab or {}).get("estimates", {})
+
+    def interval(metric: str) -> tuple[float | None, float | None, float | None]:
+        e = est.get(metric, {})
+        ci = e.get("ci95") if e.get("complete") else None
+        return (e.get("ratio"), *ci) if ci else (None, None, None)
+
+    checks = [
+        ("c1_p50_ms", "upper", AB_C1_P50_MAX_UCB, "C = 1 client p50 ratio B/A: 95% CI upper bound"),
+        ("c8_rps", "lower", AB_C8_RPS_MIN_LCB, "C = 8 throughput ratio B/A: 95% CI lower bound"),
+        ("c8_p95_ms", "upper", AB_C8_P95_MAX_UCB, "C = 8 client p95 ratio B/A: 95% CI upper bound"),
+        (
+            "peak_rss_mib",
+            "upper",
+            AB_MEMORY_MAX_UCB,
+            "peak server RSS ratio B/A: 95% CI upper bound",
+        ),
+        (
+            "peak_gpu_mem_mib",
+            "upper",
+            AB_MEMORY_MAX_UCB,
+            "peak server GPU memory ratio B/A: 95% CI upper",
+        ),
+    ]
+    for metric, side, limit, text in checks:
+        ratio, lo, hi = interval(metric)
+        op = "<=" if side == "upper" else ">="
+        if ratio is None or lo is None or hi is None:
+            verdict: bool | None = None
+        elif side == "upper":  # pass: whole interval inside; fail: estimate outside; else undecided
+            verdict = True if hi <= limit else (False if ratio > limit else None)
+        else:
+            verdict = True if lo >= limit else (False if ratio < limit else None)
+        put(f"ab: {text} {op} {limit}", "statistical", "ab", verdict,
+            ratio=ratio, ci95=[lo, hi] if lo is not None else None,
+            pairs=est.get(metric, {}).get("pairs"))  # fmt: skip
+    for metric in ("c1_prep_p50_ms", "c8_prep_p50_ms", "c8_gpu_p50_ms", "c8_queue_p50_ms",
+                   "c1_p95_ms", "c1_p99_ms", "c8_p50_ms", "c8_p99_ms", "c1_rps",
+                   "c1_cpu_pct_mean", "c8_cpu_pct_mean", "c8_gpu_util_mean"):  # fmt: skip
+        ratio, lo, hi = interval(metric)
+        out[f"info: ab {metric} ratio B/A"] = {
+            "status": "reported" if ratio is not None else "insufficient_data",
+            "kind": "info",
+            "counted": False,
+            "ratio": ratio,
+            "ci95": [lo, hi] if lo is not None else None,
+        }
 
 
 def main() -> int:

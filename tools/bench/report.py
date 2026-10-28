@@ -141,6 +141,39 @@ def main() -> int:
             )
         else:
             lines.append("Interval not available (incomplete trials).")
+    ab_f = d / "ab.json"
+    if ab_f.exists():
+        ab = json.loads(ab_f.read_text())
+
+        def num(v: Any, digits: int = 1) -> str:
+            return "-" if v is None else f"{v:.{digits}f}"
+
+        lines += [
+            "",
+            "## M6 A/B: serial (A) vs parallel preprocessing (B), fresh service per trial, ABBA",
+            "",
+            "Replicates are trial pairs (one A and one B container), not requests. Preprocessing",
+            "= response-body decode + preprocess (wall time of the decode-and-build step).",
+            "",
+            "| Trial | Arm | C1 p50 | C1 p95 | C1 p99 | C1 prep p50 | C8 p50 | C8 p95 | C8 p99 "
+            "| C8 req/s | C8 prep p50 | C8 gpu p50 | C8 queue p50 | peak RSS MiB | peak GPU MiB "
+            "| C8 CPU % | C8 GPU util % |",
+            "|" + " --- |" * 17,
+        ]
+        for t in ab["trials"]:
+            keys = ("c1_p50_ms", "c1_p95_ms", "c1_p99_ms", "c1_prep_p50_ms", "c8_p50_ms",
+                    "c8_p95_ms", "c8_p99_ms", "c8_rps", "c8_prep_p50_ms", "c8_gpu_p50_ms",
+                    "c8_queue_p50_ms", "peak_rss_mib", "peak_gpu_mem_mib", "c8_cpu_pct_mean",
+                    "c8_gpu_util_mean")  # fmt: skip
+            cells = [str(t["trial"]), t["arm"].upper(), *(num(t[k]) for k in keys)]
+            lines.append("| " + " | ".join(cells) + " |")
+        lines += ["", "| Metric | ratio B/A | 95% CI | pairs |", "| --- | --- | --- | --- |"]
+        for metric, e in ab["estimates"].items():
+            ci = e.get("ci95")
+            ci_txt = f"[{ci[0]:.3f}, {ci[1]:.3f}]" if ci else "-"
+            lines.append(
+                f"| {metric} | {num(e.get('ratio'), 3)} | {ci_txt} | {e.get('pairs', '-')} |"
+            )
     runs_f = d / "runs.jsonl"
     if runs_f.exists():
         recs = [json.loads(x) for x in runs_f.read_text().splitlines() if x.strip()]
