@@ -4,14 +4,15 @@ HTTP inference service for camera-only 3D object detection with
 [BEVDet](https://github.com/HuangJunJie2017/BEVDet): six camera images plus calibration in, 3D
 boxes out.
 
-> **Status: milestone M7.** The service serves the released BEVDet-R50 checkpoint on a local GPU
+> **Status: milestone M8.** The service serves the released BEVDet-R50 checkpoint on a local GPU
 > (`BEVSERVE_DETECTOR=bevdet`), or a **FakeDetector** with fixed synthetic boxes (default).
 > Verified locally: over all 6,019 nuScenes val frames BEVServe's input path and adapter reproduce
 > the reference evaluation (mAP 0.3086, NDS 0.3941, identical to every printed digit), and HTTP
 > responses on 200 frames are identical to BEVDet's own evaluation path. The GPU container (M4) was
 > benchmarked on one workstation (M5), and an opt-in parallel preprocessing mode was verified and
 > benchmarked against it (M6, below). A reliability review (M7) kept serial preprocessing as the
-> default (decision: conditional; see below).
+> default (decision: conditional; see below). An ingress-protection experiment (M8) was not
+> accepted, and its code was removed (see below).
 
 ## What M1 contains
 
@@ -158,8 +159,12 @@ Production admission limit 5, both preprocessing modes, verified M6 image
   own baseline); the original M7 overload pilot also failed it. Sustained-load reliability has not
   been measured.
 - Decision **conditional**: `BEVSERVE_PREPROCESS_THREADS=0` stays the default; 12 threads remains a
-  verified opt-in. An ingress-protection change (cheap rejection before parsing the upload) is
-  proposed, not implemented.
+  verified opt-in.
+- M8 ([docs/m8-report.md](docs/m8-report.md)) tested rejecting early, before parsing the upload,
+  in one pre-registered A/B (4 pairs). It improved the burst tail and goodput in every pair, but
+  the unmodified arm exceeded 2× in only 1 of 4 containers, so the reproduction criterion failed.
+  Effectiveness was not established, the change was not accepted (Option A), and its code was
+  removed. The limitation above stands; clients should honour `Retry-After`.
 
 ## API summary
 
