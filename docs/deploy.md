@@ -7,7 +7,8 @@
 | `bevserve:gpu` | `docker/Dockerfile.gpu` | Real BEVDet-R50 service on one NVIDIA GPU |
 | `bevserve:cpu-smoke` | `docker/Dockerfile.cpu` | Public T1 smoke test, CPU only, random weights |
 
-Pinned inputs (the build is reproducible from public sources):
+Pinned inputs (all public; the build was run on one workstation, and bit-for-bit image
+reproducibility is not claimed):
 
 | Input | Pin |
 | --- | --- |
@@ -16,7 +17,7 @@ Pinned inputs (the build is reproducible from public sources):
 | CPU base | `ubuntu:22.04@sha256:e0f80c82…c9b` |
 | PyTorch | 2.7.0+cu128 / 2.7.0+cpu (PyTorch index, installed without dependencies) |
 | mmcv-full | open-mmlab/mmcv `4c01b026` (tag v1.7.2) + `docker/patches/mmcv-1.7.2-torch27-get-stream.patch` |
-| BEVDet (mmdet3d) | public fork `a0142cc` (dev3.0 + Blackwell compatibility); model code and `bevdet-r50-cbgs.py` byte-identical to the M3-validated tree |
+| BEVDet (mmdet3d) | commit `a0142cc` (dev3.0 + Blackwell compatibility) on the author's public fork `github.com/pushpullleg/BEVDet` (currently on work-package branches; the build fails if it is no longer reachable); model code and `bevdet-r50-cbgs.py` byte-identical to the M3-validated tree |
 | Python packages | `docker/requirements-model.txt`: 104 exact pins from the M3-validated environment, installed with `--no-deps` |
 | GPU architectures | `CUDA_ARCH_LIST=12.0` (Blackwell, validated). Other architectures must be added at build time and are not validated |
 
@@ -24,6 +25,17 @@ The GPU image is multi-stage: the build stage compiles mmcv and BEVDet's `bev_po
 runtime stage holds only `/opt/venv`, BEVDet's configs and BEVServe, runs as uid 10001, and
 records `pip freeze` and `pip check` in `/opt/venv/`. No checkpoint, dataset or private file is in
 the build context (`.dockerignore` is a whitelist), and no image layer contains one.
+
+**Images are not published.** They bundle third-party components — NVIDIA CUDA/cuDNN base images,
+and mmcv's compiled operators, a few of which carry NVIDIA's own license — whose redistribution
+terms have not been verified for this project. Build the image yourself:
+
+```bash
+docker build -f docker/Dockerfile.gpu -t bevserve:gpu .     # first full build: 1,360 s on the test host
+docker build -f docker/Dockerfile.cpu -t bevserve:cpu-smoke . && docker run --rm bevserve:cpu-smoke
+```
+
+`docker compose ... build` uses the same Dockerfile.
 
 ## Serving
 
@@ -70,4 +82,7 @@ golden file recorded in the validated host environment.
 membership needed): build and provenance, offline self-check, Compose startup and readiness,
 loopback-only publication, real-frame parity against the M3 golden, fatal exit and supervised
 restart (`python -m bevserve.faultinject`, test-only), wrong hash, missing GPU, missing custom op,
-and clean shutdown. Results go to `outputs/m4/` (git-ignored).
+and clean shutdown. Results go to `outputs/m4-<run id>/` (git-ignored). Inputs and
+prerequisites are listed at the top of the script and in [reproducibility.md](reproducibility.md)
+(level L3). The script stops unless the kernel is `6.14.0-37-generic`, the test workstation's
+pinned kernel, so it is not portable to other hosts as is.

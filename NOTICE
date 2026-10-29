@@ -11,6 +11,19 @@ configs/bevdet-r50-cbgs-inference.py (BEVDet's model definition, used by the CPU
 - MMCV (https://github.com/open-mmlab/mmcv), Copyright (c) OpenMMLab.
   Normalization order taken from mmcv/image/photometric.py (imnormalize).
 
+Related to these projects:
+- src/bevserve/model/cpu_ops.py is an independent pure-PyTorch implementation, written for this
+  project and used only by the CPU smoke test. It computes the same forward result as BEVDet's
+  bev_pool_v2 operation (mmdet3d/ops/bev_pool_v2, a CUDA kernel), using a scatter-add. It contains
+  no code copied from BEVDet; only its call interface (argument names and order) matches
+  bev_pool_v2, so that it can be substituted for it in tests.
+- docker/patches/mmcv-1.7.2-torch27-get-stream.patch modifies one line of MMCV v1.7.2
+  (mmcv/parallel/_functions.py), and is applied when building the container images.
+
+No container image is distributed with this project. Images built from docker/ would contain
+third-party software under its own terms (including NVIDIA CUDA/cuDNN base images and MMCV
+operators listed in MMCV's LICENSES.md); those terms have not been reviewed for redistribution.
+
 Data and model weights are NOT distributed with this project.
 
 - nuScenes is provided by Motional under CC BY-NC-SA 4.0 plus the nuScenes Terms of Use.

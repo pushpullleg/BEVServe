@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "bevserve"
 version = "0.1.0.dev0"
-description = "HTTP inference service for camera-only 3D object detection (BEVDet). M1: contract, preprocessing and API with a fake detector."
+description = "HTTP inference service for camera-only 3D object detection with BEVDet-R50 (six cameras in, 3D boxes out)."
 readme = "README.md"
 license = { text = "Apache-2.0" }
 requires-python = ">=3.10,<3.11"

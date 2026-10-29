@@ -1,5 +1,12 @@
 # GPU container host setup (requires an administrator)
 
+This is the record of how the one test workstation was prepared. It is an example, not a
+requirement:
+- **Workstation-specific:** the kernel pin, the driver and the vendor package repository belong
+  to that host.
+- **Other hosts:** any Linux host with a CUDA 12.8-capable NVIDIA driver, Docker with Compose and
+  Buildx, and the NVIDIA Container Toolkit can run the container. Only that workstation was used.
+
 Audited 2026-10-27 on the BEVServe GPU host, read-only:
 
 | Item | State |
