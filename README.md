@@ -135,9 +135,13 @@ overhead of Server-Timing itself was **not established**: +1.12 ms, 95% CI −8.
     `sudo docker`.
 - **External build input:** the GPU image builds BEVDet from a pinned commit on the author's
   public fork; see [docs/reproducibility.md](docs/reproducibility.md).
-- **CI not yet run:** workflows exist (`.github/workflows/`), but this repository has not yet been
-  pushed to a remote, so **no CI run has been observed**. The T0 checks were run locally (guard,
-  lint, format, types, tests).
+- **CI covers CPU paths only.** Both workflows passed on GitHub-hosted runners for commit
+  `75444d8`, as checked by the repository owner on 2026-10-29:
+  - T0, [`ci.yml`](.github/workflows/ci.yml): guard, lint, format, types, public tests;
+  - T1, [`smoke-cpu.yml`](.github/workflows/smoke-cpu.yml): real model code with random weights.
+
+  GPU inference, the container verification suite, benchmarks and parity (levels L2–L4) are not
+  part of CI.
 
 ## API summary
 
@@ -219,5 +223,5 @@ rig.
   license), and their redistribution terms have not been verified. Build the image yourself from
   the pinned sources.
 - **Restricted-content guard:** `tools/check_restricted.py` blocks weights, dataset files, large
-  files and private paths. The CI workflow is configured to run it, and it was run locally during
+  files and private paths. It runs in the T0 CI workflow, and it was also run locally during
   development.

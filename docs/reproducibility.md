@@ -6,8 +6,8 @@ one workstation only.
 
 | Level | What runs | Needs | Verified |
 | --- | --- | --- | --- |
-| **L0** | install, restricted-content guard, lint, format, type check, public test suite, FakeDetector server and demo, `/docs` | Linux, a CPython 3.10 interpreter (not the default on current distributions), `curl`, `ss`, `setsid`; network access for pip | yes, on the workstation; a fresh clone is the M9 Stage C gate |
-| **L1** | CPU smoke test: real BEVDet model code with **random weights** and a pure-PyTorch `bev_pool_v2`, synthetic input | L0, plus building mmcv-full 1.7.2 from source (slow) and fetching BEVDet `a0142cc` | stack built locally; CI workflow never run |
+| **L0** | install, restricted-content guard, lint, format, type check, public test suite, FakeDetector server and demo, `/docs` | Linux, a CPython 3.10 interpreter (not the default on current distributions), `curl`, `ss`, `setsid`; network access for pip | yes: on the workstation, from a fresh clone (M9 Stage C: 313 passed, 4 skipped), and by the T0 workflow (`ci.yml`) on GitHub-hosted runners for commit `75444d8` (verified by the repository owner, 2026-10-29) |
+| **L1** | CPU smoke test: real BEVDet model code with **random weights** and a pure-PyTorch `bev_pool_v2`, synthetic input | L0, plus building mmcv-full 1.7.2 from source (slow) and fetching BEVDet `a0142cc` | stack built locally; T1 workflow (`smoke-cpu.yml`) passed on GitHub-hosted runners for commit `75444d8` (verified by the repository owner, 2026-10-29) |
 | **L2** | real inference with your checkpoint, on a host or in the GPU container | NVIDIA GPU (only sm_120 built and validated), Docker + NVIDIA Container Toolkit (container) or the BEVDet model environment (host), checkpoint + trusted sha256 | one workstation |
 | **L3** | container verification suite and benchmark procedures (M4–M8) | L2, plus nuScenes val, a host model environment, `sudo docker`, the exact workstation kernel (M4 script) | one workstation; not portable without changes |
 | **L4** | numerical parity against BEVDet's own evaluation | L2, plus nuScenes, a BEVDet dev3.0 checkout and its environment | once, 2026-10-27 ([verification-m3.md](verification-m3.md)) |
@@ -46,8 +46,10 @@ quaternion), so you see 200 and three 422 problem responses. `tools/demo.py` imp
 from `tests/`, so it needs a source checkout.
 
 **Notes:**
-- **CI:** these are the same steps as `.github/workflows/ci.yml`. That workflow has never run,
-  because the repository has not been pushed.
+- **CI:** these are the same steps as `.github/workflows/ci.yml` (T0). T0 and the T1 smoke
+  workflow passed on GitHub-hosted runners for commit `75444d8`, as verified by the repository
+  owner on 2026-10-29. CI covers L0 and L1 only; levels L2–L4 need a GPU and external assets and
+  are not part of CI.
 - **Python version:** dependencies are pinned exactly and require Python 3.10. numpy, Pillow and
   OpenCV match the model environment, because they change pixel values.
 
