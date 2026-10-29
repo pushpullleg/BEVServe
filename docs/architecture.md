@@ -74,7 +74,7 @@ sequenceDiagram
     L->>W: decode + preprocess (serial, or six cameras on the CameraPool)
     W-->>L: model inputs (byte-identical in both modes)
     L->>S: executor.run(inputs, deadline)
-    Note over S: one detect() at a time; queued jobs wait for the slot
+    Note over S: one detect() at a time, queued jobs wait for the slot
     alt deadline passes
         L-->>C: 504 deadline_exceeded (a running job keeps the slot until it finishes)
     else detector error
